@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: cdc_lakehouse
+    schema: "{{ env_var('CDC_LAKEHOUSE_ATHENA_DATABASE', 'cdc_mart') }}"
+    tables:
+      - name: curated_hiring_events
+        description: Curated CDC hiring events stored in the lakehouse.
+      - name: hiring_pipeline_lineage
+        description: Applicant-centered hiring pipeline lineage rows stored in the lakehouse.

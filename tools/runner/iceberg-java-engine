@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MODULE="$ROOT/tools/iceberg-engine"
+CLASSPATH_FILE="$MODULE/target/classpath.txt"
+ENGINE_JAVA_HOME="${CDC_LAKEHOUSE_ICEBERG_JAVA_HOME:-}"
+if [ -z "$ENGINE_JAVA_HOME" ] && command -v /usr/libexec/java_home >/dev/null 2>&1; then
+  ENGINE_JAVA_HOME="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"
+fi
+if [ -z "$ENGINE_JAVA_HOME" ]; then
+  ENGINE_JAVA_HOME="${JAVA_HOME:-}"
+fi
+
+if [ -n "$ENGINE_JAVA_HOME" ]; then
+  JAVA_HOME="$ENGINE_JAVA_HOME" mvn -q -f "$MODULE/pom.xml" -DskipTests clean package dependency:build-classpath -Dmdep.outputFile="$CLASSPATH_FILE" </dev/null
+  JAVA_BIN="$ENGINE_JAVA_HOME/bin/java"
+else
+  mvn -q -f "$MODULE/pom.xml" -DskipTests clean package dependency:build-classpath -Dmdep.outputFile="$CLASSPATH_FILE" </dev/null
+  JAVA_BIN="java"
+fi
+
+cd "$ROOT"
+exec "$JAVA_BIN" -cp "$MODULE/target/classes:$(cat "$CLASSPATH_FILE")" com.example.cdcplatform.tools.IcebergJavaEngine "$@"

@@ -1,0 +1,1587 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+COMPOSE_FILE = ROOT / "infra" / "local" / "docker-compose.yml"
+CONNECTOR_FILE = ROOT / "infra" / "local" / "debezium-postgres-connector.json"
+SOURCE_SCHEMA_FILE = ROOT / "backend" / "src" / "main" / "resources" / "db" / "migration" / "V1__source_schema.sql"
+DEFAULT_PROOF_DIR = ROOT / "lakehouse" / "out" / "proofs"
+CONNECT_URL = "http://localhost:8083"
+CONNECT_INTERNAL_TOPICS = ("connect_configs", "connect_offsets", "connect_statuses")
+COMPOSE_PROJECT_NAME = "cdc-data-platform"
+DEBEZIUM_SLOT_NAME = "cdc_data_platform_slot"
+DEFAULT_RUNTIME_TABLE_INCLUDE_LIST = "public.applicants"
+CDC_TOPICS = (
+    "cdc.raw.public.job_postings",
+    "cdc.raw.public.applicants",
+    "cdc.raw.public.evaluations",
+    "cdc.raw.public.agent_tasks",
+    "cdc.canonical.hiring",
+    "cdc.retry.hiring",
+    "cdc.dlq.hiring",
+)
+RUNTIME_SLA_REQUIRED_OPERATIONS = ("c", "u", "d")
+
+
+def log(message):
+    print(f"[cdc-smoke] {message}", file=sys.stderr, flush=True)
+
+
+def run(command, *, input_text=None, check=True, timeout=None):
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({completed.returncode}): {' '.join(command)}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    return completed
+
+
+def compose_files():
+    files = [COMPOSE_FILE]
+    for item in os.environ.get("CDC_SMOKE_EXTRA_COMPOSE_FILES", "").split(os.pathsep):
+        if item:
+            files.append(Path(item).resolve())
+    return files
+
+
+def compose_command(*args):
+    project_name = os.environ.get("CDC_SMOKE_COMPOSE_PROJECT_NAME", COMPOSE_PROJECT_NAME)
+    command = ["docker", "compose", "--project-name", project_name]
+    for file in compose_files():
+        command.extend(["-f", str(file)])
+    command.extend(args)
+    return command
+
+
+def compose(*args, input_text=None, check=True, timeout=None):
+    return run(
+        compose_command(*args),
+        input_text=input_text,
+        check=check,
+        timeout=timeout,
+    )
+
+
+def kafka_tool(tool_name):
+    bin_dir = os.environ.get("CDC_SMOKE_KAFKA_BIN_DIR")
+    if bin_dir:
+        return str(Path(bin_dir) / f"{tool_name}.sh")
+    return tool_name
+
+
+def runtime_connector_table_include_list():
+    return os.environ.get("CDC_SMOKE_TABLE_INCLUDE_LIST", "").strip() or DEFAULT_RUNTIME_TABLE_INCLUDE_LIST
+
+
+def runtime_connector_payload():
+    connector_payload = json.loads(CONNECTOR_FILE.read_text())
+    connector_payload["config"] = dict(connector_payload["config"])
+    connector_payload["config"]["table.include.list"] = runtime_connector_table_include_list()
+    return connector_payload
+
+
+def docker_probe_timeout_seconds():
+    timeout_seconds = int(os.environ.get("CDC_SMOKE_DOCKER_TIMEOUT_SECONDS", "10"))
+    if timeout_seconds < 1:
+        raise ValueError("CDC_SMOKE_DOCKER_TIMEOUT_SECONDS must be at least 1")
+    return timeout_seconds
+
+
+def diagnostic_docker_timeout_seconds():
+    timeout_seconds = int(os.environ.get("CDC_SMOKE_DIAGNOSTIC_DOCKER_TIMEOUT_SECONDS", "3"))
+    if timeout_seconds < 1:
+        raise ValueError("CDC_SMOKE_DIAGNOSTIC_DOCKER_TIMEOUT_SECONDS must be at least 1")
+    return timeout_seconds
+
+
+def diagnostic_inspect_timeout_seconds():
+    timeout_seconds = int(os.environ.get("CDC_SMOKE_DIAGNOSTIC_INSPECT_TIMEOUT_SECONDS", "10"))
+    if timeout_seconds < 1:
+        raise ValueError("CDC_SMOKE_DIAGNOSTIC_INSPECT_TIMEOUT_SECONDS must be at least 1")
+    return timeout_seconds
+
+
+def diagnostic_log_tail_lines():
+    tail_lines = int(os.environ.get("CDC_SMOKE_DIAGNOSTIC_LOG_TAIL_LINES", "80"))
+    if tail_lines < 1:
+        raise ValueError("CDC_SMOKE_DIAGNOSTIC_LOG_TAIL_LINES must be at least 1")
+    return tail_lines
+
+
+def topic_partitions():
+    partitions = int(os.environ.get("CDC_SMOKE_TOPIC_PARTITIONS", "1"))
+    if partitions < 1:
+        raise ValueError("CDC_SMOKE_TOPIC_PARTITIONS must be at least 1")
+    return partitions
+
+
+def docker_health_probe(timeout_seconds=None):
+    timeout = timeout_seconds or docker_probe_timeout_seconds()
+    command = ["docker", "info", "--format", "{{.ServerVersion}}"]
+    try:
+        result = run(command, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {
+            "scenario": "docker-preflight",
+            "available": False,
+            "status": "timeout",
+            "command": " ".join(command),
+            "reason": f"docker info timed out after {timeout} seconds",
+            "composeProjectName": os.environ.get("CDC_SMOKE_COMPOSE_PROJECT_NAME", COMPOSE_PROJECT_NAME),
+            "composeFiles": [str(path) for path in compose_files()],
+        }
+    if result.returncode != 0:
+        return {
+            "scenario": "docker-preflight",
+            "available": False,
+            "status": "error",
+            "command": " ".join(command),
+            "reason": (result.stderr or result.stdout).strip(),
+            "composeProjectName": os.environ.get("CDC_SMOKE_COMPOSE_PROJECT_NAME", COMPOSE_PROJECT_NAME),
+            "composeFiles": [str(path) for path in compose_files()],
+        }
+    return {
+        "scenario": "docker-preflight",
+        "available": True,
+        "status": "ok",
+        "command": " ".join(command),
+        "serverVersion": result.stdout.strip(),
+        "composeProjectName": os.environ.get("CDC_SMOKE_COMPOSE_PROJECT_NAME", COMPOSE_PROJECT_NAME),
+        "composeFiles": [str(path) for path in compose_files()],
+    }
+
+
+def require_docker_available():
+    health = docker_health_probe()
+    if not health["available"]:
+        raise RuntimeError("Docker preflight failed: " + json.dumps(health, sort_keys=True))
+    return health
+
+
+def docker_preflight():
+    print(json.dumps(docker_health_probe(), indent=2, sort_keys=True))
+
+
+def wait_until(label, probe, timeout_seconds=120, interval_seconds=2):
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            if probe():
+                return
+        except Exception as exc:
+            last_error = exc
+        time.sleep(interval_seconds)
+    raise TimeoutError(f"timed out waiting for {label}: {last_error}")
+
+
+def http_json(path, *, method="GET", payload=None, expected=(200,)):
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{CONNECT_URL}{path}",
+        data=body,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response_body = response.read().decode("utf-8")
+            if response.status not in expected:
+                raise RuntimeError(f"unexpected HTTP {response.status}: {response_body}")
+            return json.loads(response_body) if response_body else {}
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8")
+        if exc.code not in expected:
+            raise RuntimeError(f"unexpected HTTP {exc.code}: {response_body}") from exc
+        return json.loads(response_body) if response_body else {}
+
+
+def wait_for_postgres():
+    def probe():
+        result = compose(
+            "exec",
+            "-T",
+            "source-postgres",
+            "pg_isready",
+            "-U",
+            "source_user",
+            check=False,
+        )
+        return result.returncode == 0
+
+    wait_until("source-postgres", probe)
+
+
+def ensure_source_database():
+    compose(
+        "exec",
+        "-T",
+        "source-postgres",
+        "sh",
+        "-c",
+        "psql -U source_user -d postgres -tAc \"select 1 from pg_database where datname='ats_source'\" | grep -q 1 || createdb -U source_user ats_source",
+    )
+
+
+def wait_for_connect():
+    wait_until("kafka-connect", lambda: bool(http_json("/", expected=(200,))))
+
+
+def wait_for_kafka():
+    def probe():
+        result = compose(
+            "exec",
+            "-T",
+            "kafka",
+            kafka_tool("kafka-topics"),
+            "--bootstrap-server",
+            "kafka:29092",
+            "--list",
+            check=False,
+        )
+        return result.returncode == 0
+
+    wait_until("kafka broker", probe, timeout_seconds=180)
+
+
+def apply_source_schema():
+    compose(
+        "exec",
+        "-T",
+        "source-postgres",
+        "psql",
+        "-U",
+        "source_user",
+        "-d",
+        "ats_source",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-f",
+        "-",
+        input_text=SOURCE_SCHEMA_FILE.read_text(),
+    )
+
+
+def register_connector():
+    connector_payload = runtime_connector_payload()
+    name = connector_payload["name"]
+    try:
+        http_json("/connectors", method="POST", payload=connector_payload, expected=(201,))
+    except RuntimeError as exc:
+        if "HTTP 409" not in str(exc):
+            raise
+        http_json(f"/connectors/{name}/config", method="PUT", payload=connector_payload["config"], expected=(200, 201))
+    return name
+
+
+def wait_for_connector_running(name):
+    def probe():
+        status = http_json(f"/connectors/{name}/status", expected=(200,))
+        connector_state = status.get("connector", {}).get("state")
+        task_states = [task.get("state") for task in status.get("tasks", [])]
+        return connector_state == "RUNNING" and task_states and all(state == "RUNNING" for state in task_states)
+
+    wait_until(f"connector {name}", probe, timeout_seconds=180)
+
+
+def create_topics():
+    partitions = str(topic_partitions())
+    for topic in CDC_TOPICS:
+        compose(
+            "exec",
+            "-T",
+            "kafka",
+            kafka_tool("kafka-topics"),
+            "--bootstrap-server",
+            "kafka:29092",
+            "--create",
+            "--if-not-exists",
+            "--topic",
+            topic,
+            "--partitions",
+            partitions,
+            "--replication-factor",
+            "1",
+            timeout=60,
+        )
+
+
+def reset_cdc_topics():
+    for topic in CDC_TOPICS:
+        compose(
+            "exec",
+            "-T",
+            "kafka",
+            kafka_tool("kafka-topics"),
+            "--bootstrap-server",
+            "kafka:29092",
+            "--delete",
+            "--if-exists",
+            "--topic",
+            topic,
+            check=False,
+        )
+
+
+def create_connect_internal_topics():
+    for topic in CONNECT_INTERNAL_TOPICS:
+        compose(
+            "exec",
+            "-T",
+            "kafka",
+            kafka_tool("kafka-topics"),
+            "--bootstrap-server",
+            "kafka:29092",
+            "--create",
+            "--if-not-exists",
+            "--topic",
+            topic,
+            "--partitions",
+            "1",
+            "--replication-factor",
+            "1",
+            "--config",
+            "cleanup.policy=compact",
+            timeout=60,
+        )
+
+
+def reset_connect_internal_topics():
+    for topic in CONNECT_INTERNAL_TOPICS:
+        compose(
+            "exec",
+            "-T",
+            "kafka",
+            kafka_tool("kafka-topics"),
+            "--bootstrap-server",
+            "kafka:29092",
+            "--delete",
+            "--if-exists",
+            "--topic",
+            topic,
+            check=False,
+        )
+
+
+def psql(sql):
+    compose(
+        "exec",
+        "-T",
+        "source-postgres",
+        "psql",
+        "-U",
+        "source_user",
+        "-d",
+        "ats_source",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-c",
+        sql,
+    )
+
+
+def psql_scalar(sql):
+    result = compose(
+        "exec",
+        "-T",
+        "source-postgres",
+        "psql",
+        "-U",
+        "source_user",
+        "-d",
+        "ats_source",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-At",
+        "-c",
+        sql,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout).strip())
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def replication_slot_active():
+    value = psql_scalar(
+        "select active from pg_replication_slots "
+        f"where slot_name = '{DEBEZIUM_SLOT_NAME}';"
+    )
+    return value == "t"
+
+
+def wait_for_debezium_streaming_slot():
+    timeout_seconds = int(os.environ.get("CDC_SMOKE_SLOT_ACTIVE_TIMEOUT_SECONDS", "45"))
+    wait_until(
+        f"Debezium replication slot {DEBEZIUM_SLOT_NAME} to become active",
+        replication_slot_active,
+        timeout_seconds=timeout_seconds,
+        interval_seconds=1,
+    )
+
+
+def mutate_applicant():
+    applicant_id = insert_applicant("CDC Smoke Engineer", "sha256:cdc-smoke")
+    update_applicant(applicant_id)
+    delete_applicant(applicant_id)
+    return applicant_id
+
+
+def insert_applicant(job_title="CDC Restart Engineer", email_hash="sha256:cdc-restart"):
+    job_id = str(uuid.uuid4())
+    applicant_id = str(uuid.uuid4())
+    psql(
+        f"""
+        insert into job_postings(id, title, department, status, opened_at, updated_at)
+        values ('{job_id}', '{job_title}', 'Data Platform', 'OPEN', now(), now());
+        """
+    )
+    psql(
+        f"""
+        insert into applicants(id, job_posting_id, email_hash, stage, updated_at)
+        values ('{applicant_id}', '{job_id}', '{email_hash}', 'APPLIED', now());
+        """
+    )
+    return applicant_id
+
+
+def update_applicant(applicant_id):
+    psql(
+        f"""
+        update applicants
+        set stage = 'SCREENING', updated_at = now()
+        where id = '{applicant_id}';
+        """
+    )
+
+
+def delete_applicant(applicant_id):
+    psql(f"delete from applicants where id = '{applicant_id}';")
+
+
+def mutate_schema_evolved_applicant():
+    job_id = str(uuid.uuid4())
+    applicant_id = str(uuid.uuid4())
+    psql("alter table applicants drop column if exists screening_score;")
+    psql(
+        f"""
+        insert into job_postings(id, title, department, status, opened_at, updated_at)
+        values ('{job_id}', 'CDC Schema Evolution Engineer', 'Data Platform', 'OPEN', now(), now());
+        """
+    )
+    psql(
+        f"""
+        insert into applicants(id, job_posting_id, email_hash, stage, updated_at)
+        values ('{applicant_id}', '{job_id}', 'sha256:cdc-schema-evolution', 'APPLIED', now());
+        """
+    )
+    psql("alter table applicants add column screening_score integer;")
+    psql(
+        f"""
+        update applicants
+        set stage = 'SCREENING', screening_score = 87, updated_at = now()
+        where id = '{applicant_id}';
+        """
+    )
+    return applicant_id
+
+
+def parse_event(line):
+    if not line or line == "null":
+        return None
+    value = json.loads(line)
+    envelope = value.get("payload", value) if isinstance(value, dict) else None
+    if not isinstance(envelope, dict):
+        return None
+    source = envelope.get("source") or {}
+    after = envelope.get("after") or {}
+    before = envelope.get("before") or {}
+    primary_key = str((after or before).get("id", ""))
+    operation = envelope.get("op", "")
+    source_lsn = source.get("lsn") or source.get("sequence")
+    event_id = source_event_id(
+        str(source.get("name", "cdc.raw")),
+        str(source.get("schema", "public")),
+        str(source.get("table", "applicants")),
+        primary_key,
+        source_lsn,
+        operation,
+    )
+    return {
+        "sourceTable": source.get("table"),
+        "sourcePrimaryKey": primary_key,
+        "operation": operation,
+        "sourceLsn": source_lsn,
+        "sourceOffset": source_offset(source, source_lsn),
+        "sourceTimestampMillis": envelope.get("ts_ms"),
+        "eventId": event_id,
+        "rawTopic": "cdc.raw.public.applicants",
+        "before": before,
+        "after": after,
+    }
+
+
+def source_event_id(source_connector, source_schema, source_table, source_primary_key, source_lsn, operation):
+    material = "\n".join(
+        [
+            source_connector,
+            source_schema,
+            source_table,
+            source_primary_key,
+            str(source_lsn),
+            operation,
+        ]
+    )
+    return "cdc_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:40]
+
+
+def source_offset(source, source_lsn):
+    offset = {
+        "lsn": source_lsn,
+        "sequence": source.get("sequence"),
+        "txId": source.get("txId"),
+    }
+    return {key: value for key, value in offset.items() if value is not None}
+
+
+def consumer_max_messages():
+    return os.environ.get("CDC_SMOKE_CONSUMER_MAX_MESSAGES", "500")
+
+
+def kafka_consumer_command(topic, max_messages=None):
+    return compose_command(
+        "exec",
+        "-T",
+        "kafka",
+        kafka_tool("kafka-console-consumer"),
+        "--bootstrap-server",
+        "kafka:29092",
+        "--topic",
+        topic,
+        "--from-beginning",
+        "--max-messages",
+        max_messages or consumer_max_messages(),
+        "--timeout-ms",
+        os.environ.get("CDC_SMOKE_CONSUMER_TIMEOUT_MS", "30000"),
+    )
+
+
+def event_dedupe_key(event):
+    return (event["operation"], event["sourceLsn"], event["eventId"])
+
+
+def stop_process(process):
+    if process.poll() is not None:
+        close_process_pipes(process)
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+    close_process_pipes(process)
+
+
+def close_process_pipes(process):
+    for stream in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
+        if stream and hasattr(stream, "close"):
+            stream.close()
+
+
+def read_remaining_stderr(process):
+    if not process.stderr:
+        return ""
+    try:
+        return process.stderr.read()
+    except Exception:
+        return ""
+
+
+def consume_applicant_events_for_operations(applicant_id, required_operations):
+    required = set(required_operations)
+    deadline = time.monotonic() + 90
+    matched = []
+    observed_applicant_events = []
+    while time.monotonic() < deadline:
+        process = subprocess.Popen(
+            kafka_consumer_command("cdc.raw.public.applicants"),
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for line in iter(process.stdout.readline, ""):
+            try:
+                event = parse_event(line)
+            except json.JSONDecodeError:
+                continue
+            if event and event["sourceTable"] == "applicants":
+                observed = {
+                    "sourcePrimaryKey": event["sourcePrimaryKey"],
+                    "operation": event["operation"],
+                    "sourceLsn": event["sourceLsn"],
+                    "eventId": event["eventId"],
+                }
+                if observed not in observed_applicant_events:
+                    observed_applicant_events.append(observed)
+            if event and event["sourcePrimaryKey"] == applicant_id:
+                dedupe_key = event_dedupe_key(event)
+                if dedupe_key not in [event_dedupe_key(item) for item in matched]:
+                    matched.append(event)
+            operations = {event["operation"] for event in matched}
+            if required.issubset(operations):
+                stop_process(process)
+                return matched
+        return_code = process.wait(timeout=5)
+        if return_code != 0:
+            reason = read_remaining_stderr(process).strip()
+            close_process_pipes(process)
+            raise RuntimeError(
+                "Kafka consumer failed while reading cdc.raw.public.applicants "
+                f"for applicant {applicant_id}: {reason}"
+            )
+        close_process_pipes(process)
+        operations = {event["operation"] for event in matched}
+        if required.issubset(operations):
+            return matched
+        time.sleep(3)
+    raise TimeoutError(
+        "did not observe required CDC operations "
+        f"{sorted(required)} for applicant {applicant_id}; matched={matched}; "
+        f"observedApplicantEvents={observed_applicant_events[-10:]}"
+    )
+
+
+def consume_applicant_events(applicant_id):
+    return consume_applicant_events_for_operations(applicant_id, {"c", "u", "d"})
+
+
+def consume_schema_evolution_events(applicant_id):
+    deadline = time.monotonic() + 90
+    matched = []
+    while time.monotonic() < deadline:
+        result = compose(
+            "exec",
+            "-T",
+            "kafka",
+            kafka_tool("kafka-console-consumer"),
+            "--bootstrap-server",
+            "kafka:29092",
+            "--topic",
+            "cdc.raw.public.applicants",
+            "--from-beginning",
+            "--max-messages",
+            os.environ.get("CDC_SMOKE_CONSUMER_MAX_MESSAGES", "80"),
+            "--timeout-ms",
+            os.environ.get("CDC_SMOKE_CONSUMER_TIMEOUT_MS", "30000"),
+            check=False,
+            timeout=120,
+        )
+        for line in result.stdout.splitlines():
+            try:
+                event = parse_event(line)
+            except json.JSONDecodeError:
+                continue
+            if event and event["sourcePrimaryKey"] == applicant_id:
+                dedupe_key = (event["operation"], event["sourceLsn"], event["eventId"])
+                if dedupe_key not in [(item["operation"], item["sourceLsn"], item["eventId"]) for item in matched]:
+                    matched.append(event)
+        operations = {event["operation"] for event in matched}
+        schema_added_update = [
+            event for event in matched
+            if event["operation"] == "u" and event["after"].get("screening_score") is not None
+        ]
+        if {"c", "u"}.issubset(operations) and schema_added_update:
+            return matched
+        time.sleep(3)
+    raise TimeoutError(
+        "did not observe schema evolution CDC update for applicant "
+        f"{applicant_id}; matched={matched}"
+    )
+
+
+def connector_offsets(name):
+    try:
+        return http_json(f"/connectors/{name}/offsets", expected=(200,))
+    except (RuntimeError, TimeoutError, urllib.error.URLError) as exc:
+        return {"unavailable": str(exc)}
+
+
+def prepare_runtime_connector():
+    log("checking Docker daemon")
+    require_docker_available()
+    log("starting source-postgres and kafka")
+    compose("up", "-d", "source-postgres", "kafka", timeout=180)
+    log("waiting for source-postgres")
+    wait_for_postgres()
+    log("ensuring ats_source database exists")
+    ensure_source_database()
+    log("applying source schema")
+    apply_source_schema()
+    log("waiting for Kafka broker")
+    wait_for_kafka()
+    log("resetting local CDC topics")
+    reset_cdc_topics()
+    log("creating Kafka topics")
+    create_topics()
+    log("resetting local Kafka Connect internal topics")
+    reset_connect_internal_topics()
+    log("creating local Kafka Connect internal topics")
+    create_connect_internal_topics()
+    log("starting kafka-connect")
+    compose("up", "-d", "--force-recreate", "kafka-connect", timeout=180)
+    log("waiting for Kafka Connect")
+    wait_for_connect()
+    log("registering Debezium connector")
+    connector_name = register_connector()
+    log("waiting for Debezium connector to run")
+    wait_for_connector_running(connector_name)
+    log("waiting for Debezium replication slot to become active")
+    wait_for_debezium_streaming_slot()
+    return connector_name
+
+
+def applicant_change_capture():
+    connector_name = prepare_runtime_connector()
+    log("mutating applicant row")
+    applicant_id = mutate_applicant()
+    log("consuming raw applicant CDC events")
+    events = consume_applicant_events(applicant_id)
+    offsets = connector_offsets(connector_name)
+
+    event_ids = [event["eventId"] for event in events]
+    proof = {
+        "scenario": "applicant-change-capture",
+        "sourceTable": "applicants",
+        "sourcePrimaryKey": applicant_id,
+        "connectorTableIncludeList": runtime_connector_table_include_list(),
+        "operations": [event["operation"] for event in events],
+        "sourceLsn": [event["sourceLsn"] for event in events],
+        "eventSourceOffset": [event["sourceOffset"] for event in events],
+        "eventId": event_ids,
+        "eventIds": event_ids,
+        "rawTopic": "cdc.raw.public.applicants",
+        "rawEventCount": len(events),
+        "canonicalEventCount": 0,
+        "canonicalStatus": "not_implemented_in_m2_source_cdc_slice",
+        "sourceOffset": offsets,
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def stability_duration_seconds():
+    duration = int(os.environ.get("CDC_SMOKE_STABILITY_SECONDS", "30"))
+    if duration < 1:
+        raise ValueError("CDC_SMOKE_STABILITY_SECONDS must be at least 1")
+    return duration
+
+
+def stability_interval_seconds():
+    interval = int(os.environ.get("CDC_SMOKE_STABILITY_INTERVAL_SECONDS", "5"))
+    if interval < 1:
+        raise ValueError("CDC_SMOKE_STABILITY_INTERVAL_SECONDS must be at least 1")
+    return interval
+
+
+def connector_status_summary(name):
+    status = http_json(f"/connectors/{name}/status", expected=(200,))
+    return {
+        "connectorState": status.get("connector", {}).get("state"),
+        "taskStates": [task.get("state") for task in status.get("tasks", [])],
+    }
+
+
+def parse_compose_json(stdout):
+    text = stdout.strip()
+    if not text:
+        return []
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, list) else [value]
+    except json.JSONDecodeError:
+        items = []
+        for line in text.splitlines():
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return items
+
+
+def service_status(service):
+    result = compose("ps", "-a", "--format", "json", service, check=False)
+    if result.returncode != 0:
+        return {
+            "service": service,
+            "state": "unknown",
+            "reason": (result.stderr or result.stdout).strip(),
+        }
+    items = parse_compose_json(result.stdout)
+    if not items:
+        return {
+            "service": service,
+            "state": "unknown",
+            "rawStatus": result.stdout.strip(),
+        }
+    item = items[0]
+    status = {
+        "service": item.get("Service") or service,
+        "name": item.get("Name") or item.get("Names"),
+        "state": item.get("State"),
+        "status": item.get("Status"),
+    }
+    if item.get("ExitCode") is not None:
+        status["exitCode"] = item.get("ExitCode")
+    return {key: value for key, value in status.items() if value is not None}
+
+
+def container_inspect(container_name):
+    if not container_name:
+        return {
+            "available": False,
+            "reason": "container name unavailable",
+        }
+    try:
+        result = run(
+            ["docker", "inspect", container_name],
+            check=False,
+            timeout=diagnostic_inspect_timeout_seconds(),
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "available": False,
+            "name": container_name,
+            "reason": f"docker inspect timed out after {diagnostic_inspect_timeout_seconds()} seconds",
+        }
+    if result.returncode != 0:
+        return {
+            "available": False,
+            "name": container_name,
+            "reason": (result.stderr or result.stdout).strip(),
+        }
+    try:
+        items = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return {
+            "available": False,
+            "name": container_name,
+            "reason": f"docker inspect returned invalid JSON: {exc}",
+            "raw": result.stdout.strip(),
+        }
+    if not items:
+        return {
+            "available": False,
+            "name": container_name,
+            "reason": "docker inspect returned no container records",
+        }
+    item = items[0]
+    state = item.get("State", {})
+    config = item.get("Config", {})
+    return {
+        "available": True,
+        "name": container_name,
+        "image": config.get("Image"),
+        "restartCount": item.get("RestartCount"),
+        "state": {
+            "status": state.get("Status"),
+            "running": state.get("Running"),
+            "exitCode": state.get("ExitCode"),
+            "oomKilled": state.get("OOMKilled"),
+            "error": state.get("Error"),
+            "startedAt": state.get("StartedAt"),
+            "finishedAt": state.get("FinishedAt"),
+        },
+    }
+
+
+def service_log_tail(service):
+    tail_lines = diagnostic_log_tail_lines()
+    try:
+        result = compose(
+            "logs",
+            "--no-color",
+            "--tail",
+            str(tail_lines),
+            service,
+            check=False,
+            timeout=diagnostic_docker_timeout_seconds(),
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "available": False,
+            "service": service,
+            "reason": f"docker compose logs timed out after {diagnostic_docker_timeout_seconds()} seconds",
+        }
+    if result.returncode != 0:
+        return {
+            "available": False,
+            "service": service,
+            "reason": (result.stderr or result.stdout).strip(),
+        }
+    lines = result.stdout.splitlines()
+    return {
+        "available": True,
+        "service": service,
+        "tailLineCount": len(lines),
+        "tail": lines[-tail_lines:],
+    }
+
+
+def service_failure_diagnostics(service):
+    status = service_status(service)
+    container_name = status.get("name")
+    return {
+        "serviceStatus": status,
+        "containerInspect": container_inspect(container_name),
+        "recentLogs": service_log_tail(service),
+        "dockerPreflight": docker_health_probe(timeout_seconds=diagnostic_docker_timeout_seconds()),
+    }
+
+
+def connector_stability_failure_message(message, samples):
+    diagnostics = service_failure_diagnostics("kafka-connect")
+    return (
+        f"{message}; "
+        f"samples={json.dumps(samples, sort_keys=True)}; "
+        f"diagnostics={json.dumps(diagnostics, sort_keys=True)}"
+    )
+
+
+def observe_connector_stability(name, duration_seconds):
+    started = time.monotonic()
+    deadline = started + duration_seconds
+    samples = []
+    while True:
+        elapsed = int(time.monotonic() - started)
+        try:
+            summary = connector_status_summary(name)
+        except Exception as exc:
+            raise RuntimeError(
+                connector_stability_failure_message(
+                    f"Kafka Connect stability status probe failed: {exc}",
+                    samples,
+                )
+            ) from exc
+        task_states = summary["taskStates"]
+        sample = {
+            "elapsedSeconds": elapsed,
+            "connectorState": summary["connectorState"],
+            "taskStates": task_states,
+            "running": summary["connectorState"] == "RUNNING" and task_states and all(state == "RUNNING" for state in task_states),
+        }
+        samples.append(sample)
+        if not sample["running"]:
+            raise RuntimeError(
+                connector_stability_failure_message(
+                    "Kafka Connect did not stay running",
+                    samples,
+                )
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return samples
+        time.sleep(min(stability_interval_seconds(), remaining))
+
+
+def restart_kafka_connect(name):
+    compose("up", "-d", "--force-recreate", "kafka-connect", timeout=180)
+    wait_for_connect()
+    wait_for_connector_running(name)
+
+
+def stop_kafka_for_outage():
+    compose("stop", "kafka", timeout=180)
+
+
+def start_kafka_after_outage(name):
+    compose("up", "-d", "kafka", timeout=180)
+    wait_for_kafka()
+    wait_for_connect()
+    wait_for_connector_running(name)
+
+
+def source_lsn_sort_value(value):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    if isinstance(value, list) and value:
+        return source_lsn_sort_value(value[-1])
+    return None
+
+
+def duplicate_event_count(events):
+    keys = [(event["operation"], event["sourceLsn"], event["eventId"]) for event in events]
+    return len(keys) - len(set(json.dumps(key, sort_keys=True) for key in keys))
+
+
+def missing_event_count(events, expected_operations):
+    observed = {event["operation"] for event in events}
+    return len(set(expected_operations) - observed)
+
+
+def durable_offset_resumed(pre_restart_events, post_restart_events):
+    pre_lsns = [
+        source_lsn_sort_value(event["sourceLsn"])
+        for event in pre_restart_events
+    ]
+    post_lsns = [
+        source_lsn_sort_value(event["sourceLsn"])
+        for event in post_restart_events
+    ]
+    pre_lsns = [value for value in pre_lsns if value is not None]
+    post_lsns = [value for value in post_lsns if value is not None]
+    return bool(pre_lsns and post_lsns and min(post_lsns) > max(pre_lsns))
+
+
+def current_time_millis():
+    return int(time.time() * 1000)
+
+
+def env_float(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    parsed = float(value)
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def env_int(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def ratio(numerator, denominator, empty_value):
+    if denominator == 0:
+        return empty_value
+    return numerator / denominator
+
+
+def unique_runtime_events(events):
+    unique = []
+    seen = set()
+    for event in events:
+        key = json.dumps(event_dedupe_key(event), sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            unique.append(event)
+    return unique
+
+
+def numeric_source_lsn_values(events):
+    values = []
+    for event in events:
+        value = source_lsn_sort_value(event.get("sourceLsn"))
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def latest_source_timestamp_millis(events):
+    values = []
+    for event in events:
+        value = event.get("sourceTimestampMillis")
+        if isinstance(value, int):
+            values.append(value)
+        elif isinstance(value, str) and value.isdigit():
+            values.append(int(value))
+    return max(values) if values else None
+
+
+def extract_connector_offset_lsn(offsets):
+    candidates = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            if "lsn" in value:
+                parsed = source_lsn_sort_value(value["lsn"])
+                if parsed is not None:
+                    candidates.append(parsed)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(offsets)
+    return max(candidates) if candidates else None
+
+
+def runtime_sla_thresholds():
+    return {
+        "minCompletenessRatio": env_float("CDC_SMOKE_RUNTIME_SLA_MIN_COMPLETENESS_RATIO", 1.0),
+        "maxDuplicateRatio": env_float("CDC_SMOKE_RUNTIME_SLA_MAX_DUPLICATE_RATIO", 0.0),
+        "maxFreshnessLagMillis": env_int("CDC_SMOKE_RUNTIME_SLA_MAX_FRESHNESS_LAG_MILLIS", 600000),
+        "maxSourceLsnLag": env_int("CDC_SMOKE_RUNTIME_SLA_MAX_SOURCE_LSN_LAG", 1000000),
+    }
+
+
+def build_runtime_sla_proof(
+    connector_name,
+    applicant_id,
+    events,
+    offsets,
+    *,
+    observed_at_millis=None,
+):
+    observed_at = observed_at_millis if observed_at_millis is not None else current_time_millis()
+    thresholds = runtime_sla_thresholds()
+    required_operations = set(RUNTIME_SLA_REQUIRED_OPERATIONS)
+    unique_events = unique_runtime_events(events)
+    duplicate_count = duplicate_event_count(events)
+    missing_count = missing_event_count(events, required_operations)
+    expected_event_count = len(required_operations)
+    observed_required_operations = {
+        event["operation"] for event in unique_events
+        if event["operation"] in required_operations
+    }
+    completeness_ratio = ratio(len(observed_required_operations), expected_event_count, 1.0)
+    duplicate_ratio = ratio(duplicate_count, len(events), 0.0)
+    source_lsn_values = numeric_source_lsn_values(events)
+    source_lsn_from = min(source_lsn_values) if source_lsn_values else None
+    source_lsn_to = max(source_lsn_values) if source_lsn_values else None
+    latest_source_ts = latest_source_timestamp_millis(events)
+    freshness_lag = None if latest_source_ts is None else max(0, observed_at - latest_source_ts)
+    connector_offset_lsn = extract_connector_offset_lsn(offsets)
+    if source_lsn_to is None or connector_offset_lsn is None:
+        source_lsn_lag = None
+    else:
+        source_lsn_lag = max(0, connector_offset_lsn - source_lsn_to)
+
+    violated_slo_ids = []
+    warning_slo_ids = []
+    if completeness_ratio < thresholds["minCompletenessRatio"] or missing_count > 0:
+        violated_slo_ids.append("completeness")
+    if duplicate_ratio > thresholds["maxDuplicateRatio"]:
+        violated_slo_ids.append("duplicate-rate")
+    elif duplicate_count > 0:
+        warning_slo_ids.append("duplicate-rate")
+    if freshness_lag is None:
+        warning_slo_ids.append("freshness-unavailable")
+    elif freshness_lag > thresholds["maxFreshnessLagMillis"]:
+        violated_slo_ids.append("freshness")
+    if source_lsn_lag is None:
+        warning_slo_ids.append("source-lsn-lag-unavailable")
+    elif source_lsn_lag > thresholds["maxSourceLsnLag"]:
+        violated_slo_ids.append("source-lsn-lag")
+
+    if violated_slo_ids:
+        sla_status = "FAILED"
+    elif warning_slo_ids:
+        sla_status = "WARN"
+    else:
+        sla_status = "PASSED"
+
+    event_ids = [event["eventId"] for event in events]
+    proof = {
+        "scenario": "quality-sla-runtime",
+        "evidenceLabel": "local-docker-debezium-runtime-sla",
+        "sourceTable": "applicants",
+        "sourcePrimaryKey": applicant_id,
+        "connectorName": connector_name,
+        "connectorTableIncludeList": runtime_connector_table_include_list(),
+        "requiredOperations": list(RUNTIME_SLA_REQUIRED_OPERATIONS),
+        "operations": [event["operation"] for event in events],
+        "sourceLsn": [event["sourceLsn"] for event in events],
+        "sourceLsnFrom": source_lsn_from,
+        "sourceLsnTo": source_lsn_to,
+        "eventSourceOffset": [event["sourceOffset"] for event in events],
+        "eventId": event_ids,
+        "eventIds": event_ids,
+        "rawTopic": "cdc.raw.public.applicants",
+        "rawEventCount": len(events),
+        "expectedEventCount": expected_event_count,
+        "observedRuntimeEventCount": len(unique_events),
+        "duplicateEventCount": duplicate_count,
+        "missingEventCount": missing_count,
+        "completenessRatio": completeness_ratio,
+        "duplicateRatio": duplicate_ratio,
+        "freshnessLagMillis": freshness_lag,
+        "maxFreshnessLagMillis": thresholds["maxFreshnessLagMillis"],
+        "sourceConnectorOffsetLsn": connector_offset_lsn,
+        "sourceLsnLag": source_lsn_lag,
+        "maxSourceLsnLag": thresholds["maxSourceLsnLag"],
+        "minCompletenessRatio": thresholds["minCompletenessRatio"],
+        "maxDuplicateRatio": thresholds["maxDuplicateRatio"],
+        "slaStatus": sla_status,
+        "violatedSloIds": violated_slo_ids,
+        "warningSloIds": warning_slo_ids,
+        "sourceOffset": offsets,
+        "notes": (
+            "Local Docker Debezium/Kafka runtime SLA observation. "
+            "Freshness is derived from Debezium event ts_ms and local observation time; "
+            "event ids remain source metadata based. This is not production-scale proof."
+        ),
+    }
+    return proof
+
+
+def write_proof_artifact(proof_dir, file_name, proof):
+    proof_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = proof_dir / file_name
+    artifact_path.write_text(json.dumps(proof, indent=2, sort_keys=True), encoding="utf-8")
+    return artifact_path
+
+
+def quality_sla_runtime(proof_dir=DEFAULT_PROOF_DIR):
+    connector_name = prepare_runtime_connector()
+    log("mutating applicant row for runtime SLA observation")
+    applicant_id = mutate_applicant()
+    log("consuming raw applicant CDC events for runtime SLA observation")
+    events = consume_applicant_events(applicant_id)
+    offsets = connector_offsets(connector_name)
+    proof = build_runtime_sla_proof(connector_name, applicant_id, events, offsets)
+    write_proof_artifact(Path(proof_dir), "quality-sla-runtime.json", proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def connect_stability():
+    connector_name = prepare_runtime_connector()
+    log("mutating applicant row")
+    applicant_id = mutate_applicant()
+    log("consuming raw applicant CDC events")
+    events = consume_applicant_events(applicant_id)
+    duration = stability_duration_seconds()
+    log(f"observing Kafka Connect stability for {duration} seconds")
+    try:
+        samples = observe_connector_stability(connector_name, duration)
+    except Exception as exc:
+        failure = {
+            "scenario": "connect-stability",
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": applicant_id,
+            "connectorTableIncludeList": runtime_connector_table_include_list(),
+            "operations": [event["operation"] for event in events],
+            "sourceLsn": [event["sourceLsn"] for event in events],
+            "eventSourceOffset": [event["sourceOffset"] for event in events],
+            "eventId": [event["eventId"] for event in events],
+            "rawTopic": "cdc.raw.public.applicants",
+            "rawEventCount": len(events),
+            "stabilitySecondsRequested": duration,
+            "failure": str(exc),
+        }
+        raise RuntimeError(
+            "connect-stability failed after raw CDC capture: "
+            + json.dumps(failure)
+        ) from exc
+    offsets = connector_offsets(connector_name)
+    proof = {
+        "scenario": "connect-stability",
+        "sourceTable": "applicants",
+        "sourcePrimaryKey": applicant_id,
+        "connectorTableIncludeList": runtime_connector_table_include_list(),
+        "operations": [event["operation"] for event in events],
+        "sourceLsn": [event["sourceLsn"] for event in events],
+        "eventSourceOffset": [event["sourceOffset"] for event in events],
+        "eventId": [event["eventId"] for event in events],
+        "rawTopic": "cdc.raw.public.applicants",
+        "rawEventCount": len(events),
+        "stabilitySecondsRequested": duration,
+        "stabilitySecondsObserved": samples[-1]["elapsedSeconds"],
+        "connectorStatusSamples": samples,
+        "sourceOffset": offsets,
+        "notes": "Local Docker Kafka Connect stability smoke. Duration is observed runtime evidence, not production-scale availability proof.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def kafka_outage_recovery():
+    connector_name = prepare_runtime_connector()
+    log("inserting applicant row before Kafka outage")
+    applicant_id = insert_applicant("CDC Kafka Outage Engineer", "sha256:cdc-kafka-outage")
+    log("consuming pre-outage applicant create event")
+    pre_outage_events = consume_applicant_events_for_operations(applicant_id, {"c"})
+    connector_status_before_outage = connector_status_summary(connector_name)
+    offset_before_outage = connector_offsets(connector_name)
+    kafka_status_before_outage = service_status("kafka")
+
+    log("stopping Kafka service for outage simulation")
+    stop_kafka_for_outage()
+    kafka_status_during_outage = service_status("kafka")
+
+    log("mutating applicant row while Kafka is stopped")
+    update_applicant(applicant_id)
+    delete_applicant(applicant_id)
+
+    log("starting Kafka service after outage")
+    start_kafka_after_outage(connector_name)
+    kafka_status_after_recovery = service_status("kafka")
+    connector_status_after_recovery = connector_status_summary(connector_name)
+
+    log("consuming post-recovery applicant update/delete events")
+    events = consume_applicant_events_for_operations(applicant_id, {"c", "u", "d"})
+    offset_after_recovery = connector_offsets(connector_name)
+    post_recovery_events = [
+        event for event in events
+        if event["operation"] in {"u", "d"}
+    ]
+    duplicate_count = duplicate_event_count(events)
+    missing_count = missing_event_count(events, {"c", "u", "d"})
+
+    proof = {
+        "scenario": "kafka-outage-recovery",
+        "evidenceLabel": "local-docker-debezium-runtime",
+        "sourceTable": "applicants",
+        "sourcePrimaryKey": applicant_id,
+        "connectorTableIncludeList": runtime_connector_table_include_list(),
+        "operationsBeforeOutage": [event["operation"] for event in pre_outage_events],
+        "sourceMutationsDuringOutage": ["u", "d"],
+        "operationsAfterRecovery": [event["operation"] for event in post_recovery_events],
+        "operations": [event["operation"] for event in events],
+        "sourceLsn": [event["sourceLsn"] for event in events],
+        "eventSourceOffset": [event["sourceOffset"] for event in events],
+        "eventId": [event["eventId"] for event in events],
+        "rawTopic": "cdc.raw.public.applicants",
+        "rawEventCount": len(events),
+        "recoveryAction": "kafka-stop-start",
+        "connectorStatusBeforeOutage": connector_status_before_outage,
+        "connectorStatusAfterRecovery": connector_status_after_recovery,
+        "kafkaStatusBeforeOutage": kafka_status_before_outage,
+        "kafkaStatusDuringOutage": kafka_status_during_outage,
+        "kafkaStatusAfterRecovery": kafka_status_after_recovery,
+        "sourceOffsetBeforeOutage": offset_before_outage,
+        "sourceOffsetAfterRecovery": offset_after_recovery,
+        "durableOffsetResumed": durable_offset_resumed(pre_outage_events, post_recovery_events),
+        "missingEventCount": missing_count,
+        "duplicateEventCount": duplicate_count,
+        "notes": "Local Docker Kafka outage recovery smoke. This is reproducible local evidence, not production-scale proof.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def connector_restart_recovery():
+    connector_name = prepare_runtime_connector()
+    log("inserting applicant row before Kafka Connect restart")
+    applicant_id = insert_applicant()
+    log("consuming pre-restart applicant create event")
+    pre_restart_events = consume_applicant_events_for_operations(applicant_id, {"c"})
+    status_before_restart = connector_status_summary(connector_name)
+    offset_before_restart = connector_offsets(connector_name)
+
+    log("recreating Kafka Connect service")
+    restart_kafka_connect(connector_name)
+    status_after_restart = connector_status_summary(connector_name)
+
+    log("mutating applicant row after Kafka Connect restart")
+    update_applicant(applicant_id)
+    delete_applicant(applicant_id)
+    log("consuming post-restart applicant update/delete events")
+    events = consume_applicant_events_for_operations(applicant_id, {"c", "u", "d"})
+    offset_after_restart = connector_offsets(connector_name)
+    post_restart_events = [
+        event for event in events
+        if event["operation"] in {"u", "d"}
+    ]
+    duplicate_count = duplicate_event_count(events)
+    missing_count = missing_event_count(events, {"c", "u", "d"})
+
+    proof = {
+        "scenario": "connector-restart-recovery",
+        "evidenceLabel": "local-docker-debezium-runtime",
+        "sourceTable": "applicants",
+        "sourcePrimaryKey": applicant_id,
+        "connectorTableIncludeList": runtime_connector_table_include_list(),
+        "operationsBeforeRestart": [event["operation"] for event in pre_restart_events],
+        "operationsAfterRestart": [event["operation"] for event in post_restart_events],
+        "operations": [event["operation"] for event in events],
+        "sourceLsn": [event["sourceLsn"] for event in events],
+        "eventSourceOffset": [event["sourceOffset"] for event in events],
+        "eventId": [event["eventId"] for event in events],
+        "rawTopic": "cdc.raw.public.applicants",
+        "rawEventCount": len(events),
+        "recoveryAction": "kafka-connect-force-recreate",
+        "connectorStatusBeforeRestart": status_before_restart,
+        "connectorStatusAfterRestart": status_after_restart,
+        "sourceOffsetBeforeRestart": offset_before_restart,
+        "sourceOffsetAfterRestart": offset_after_restart,
+        "durableOffsetResumed": durable_offset_resumed(pre_restart_events, post_restart_events),
+        "missingEventCount": missing_count,
+        "duplicateEventCount": duplicate_count,
+        "notes": "Local Docker Kafka Connect restart recovery smoke. This is reproducible local evidence, not production-scale proof.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def schema_evolution_runtime():
+    connector_name = prepare_runtime_connector()
+    log("mutating schema-evolved applicant row")
+    applicant_id = mutate_schema_evolved_applicant()
+    log("consuming schema evolution CDC events")
+    events = consume_schema_evolution_events(applicant_id)
+    offsets = connector_offsets(connector_name)
+    schema_added_events = [
+        event for event in events
+        if event["operation"] == "u" and event["after"].get("screening_score") is not None
+    ]
+    proof = {
+        "scenario": "schema-evolution-runtime",
+        "evidenceLabel": "local-docker-debezium-runtime",
+        "sourceTable": "applicants",
+        "sourcePrimaryKey": applicant_id,
+        "connectorTableIncludeList": runtime_connector_table_include_list(),
+        "operations": [event["operation"] for event in events],
+        "sourceLsn": [event["sourceLsn"] for event in events],
+        "eventSourceOffset": [event["sourceOffset"] for event in events],
+        "eventId": [event["eventId"] for event in events],
+        "schemaVersions": ["v1_before_screening_score", "v2_added_screening_score"],
+        "schemaAddedField": "screening_score",
+        "schemaAddedFieldObserved": bool(schema_added_events),
+        "schemaAddedFieldValue": schema_added_events[-1]["after"].get("screening_score") if schema_added_events else None,
+        "rawTopic": "cdc.raw.public.applicants",
+        "runtimeEventCount": len(events),
+        "sourceOffset": offsets,
+        "notes": "Local Docker Debezium schema evolution runtime smoke. This is reproducible local evidence, not production-scale proof.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def schema_evolution_fixture():
+    applicant_id = "applicant-001"
+    raw_events = [
+        {
+            "payload": {
+                "before": None,
+                "after": {
+                    "id": applicant_id,
+                    "stage": "APPLIED",
+                },
+                "source": {
+                    "name": "debezium-source",
+                    "schema": "public",
+                    "table": "applicants",
+                    "lsn": 88432240,
+                },
+                "op": "c",
+                "ts_ms": 1780987200000,
+            }
+        },
+        {
+            "payload": {
+                "before": {
+                    "id": applicant_id,
+                    "stage": "APPLIED",
+                },
+                "after": {
+                    "id": applicant_id,
+                    "stage": "SCREENING",
+                    "screening_score": 87,
+                },
+                "source": {
+                    "name": "debezium-source",
+                    "schema": "public",
+                    "table": "applicants",
+                    "lsn": 88432241,
+                },
+                "op": "u",
+                "ts_ms": 1780987205000,
+            }
+        },
+    ]
+    events = [parse_event(json.dumps(event)) for event in raw_events]
+    proof = {
+        "scenario": "schema-evolution-fixture",
+        "evidenceLabel": "fixture",
+        "sourceTable": "applicants",
+        "sourcePrimaryKey": applicant_id,
+        "operations": [event["operation"] for event in events],
+        "sourceLsn": [event["sourceLsn"] for event in events],
+        "eventSourceOffset": [event["sourceOffset"] for event in events],
+        "eventId": [event["eventId"] for event in events],
+        "schemaVersions": ["v1", "v2_added_screening_score"],
+        "sourceOffset": {
+            "file": "000000010000000000000058",
+            "pos": 32240,
+        },
+        "runtimeEventCount": 0,
+        "notes": "Fixture-only schema evolution evidence. This is not Debezium runtime capture proof.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run local CDC smoke scenarios.")
+    parser.add_argument(
+        "scenario",
+        nargs="?",
+        choices=[
+            "applicant-change-capture",
+            "connect-stability",
+            "connector-restart-recovery",
+            "docker-preflight",
+            "kafka-outage-recovery",
+            "quality-sla-runtime",
+            "schema-evolution-fixture",
+            "schema-evolution-runtime",
+        ],
+        help="smoke scenario to run",
+    )
+    parser.add_argument(
+        "--proof-dir",
+        default=str(DEFAULT_PROOF_DIR),
+        help="directory for machine-readable proof artifacts",
+    )
+    args = parser.parse_args()
+    if args.scenario == "applicant-change-capture":
+        applicant_change_capture()
+        return
+    if args.scenario == "connect-stability":
+        connect_stability()
+        return
+    if args.scenario == "connector-restart-recovery":
+        connector_restart_recovery()
+        return
+    if args.scenario == "docker-preflight":
+        docker_preflight()
+        return
+    if args.scenario == "kafka-outage-recovery":
+        kafka_outage_recovery()
+        return
+    if args.scenario == "quality-sla-runtime":
+        quality_sla_runtime(Path(args.proof_dir))
+        return
+    if args.scenario == "schema-evolution-fixture":
+        schema_evolution_fixture()
+        return
+    if args.scenario == "schema-evolution-runtime":
+        schema_evolution_runtime()
+        return
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"cdc-smoke failed: {exc}", file=sys.stderr)
+        sys.exit(1)
