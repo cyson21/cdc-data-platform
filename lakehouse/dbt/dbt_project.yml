@@ -1,0 +1,15 @@
+name: cdc_data_platform
+version: "1.0"
+config-version: 2
+
+profile: cdc_data_platform_athena
+
+model-paths:
+  - models
+
+models:
+  cdc_data_platform:
+    curated:
+      +materialized: view
+    marts:
+      +materialized: table

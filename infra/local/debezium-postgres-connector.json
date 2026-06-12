@@ -1,0 +1,30 @@
+{
+  "name": "cdc-data-platform-postgres-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "plugin.name": "pgoutput",
+    "database.hostname": "source-postgres",
+    "database.port": "5432",
+    "database.user": "source_user",
+    "database.password": "source_password",
+    "database.dbname": "ats_source",
+    "topic.prefix": "cdc.raw",
+    "schema.include.list": "public",
+    "table.include.list": "public.job_postings,public.applicants,public.evaluations,public.agent_tasks",
+    "slot.name": "cdc_data_platform_slot",
+    "publication.name": "cdc_data_platform_publication",
+    "publication.autocreate.mode": "filtered",
+    "include.schema.changes": "false",
+    "tombstones.on.delete": "true",
+    "heartbeat.interval.ms": "10000",
+    "decimal.handling.mode": "string",
+    "time.precision.mode": "adaptive_time_microseconds",
+    "snapshot.mode": "no_data",
+    "producer.buffer.memory": "1048576",
+    "producer.batch.size": "4096",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}

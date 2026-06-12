@@ -1,0 +1,2938 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import hmac
+import http.server
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections import Counter, defaultdict
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OUTPUT_DIR = ROOT / "lakehouse" / "out"
+DEFAULT_BUCKET = "cdc-lakehouse"
+DEFAULT_COMPOSE_PROJECT = "cdc-data-platform"
+DEFAULT_LOCAL_COMPOSE_FILE = ROOT / "infra" / "local" / "docker-compose.yml"
+DEFAULT_MINIO_IMAGE = "minio/minio:RELEASE.2025-04-22T22-12-26Z"
+DEFAULT_TRINO_IMAGE = "trinodb/trino:455"
+DEFAULT_ICEBERG_CATALOG_POSTGRES_IMAGE = "postgres:16"
+CURATED_OBJECT_KEY = "curated/hiring_events/event_date=2026-06-09/part-0001.jsonl"
+BACKFILL_MERGED_OBJECT_KEY = "backfill/applicant_current_state/snapshot_date=2026-06-12/part-0001.jsonl"
+BACKFILL_APPLIED_CDC_OBJECT_KEY = "backfill/applied_cdc_events/snapshot_date=2026-06-12/part-0001.jsonl"
+LINEAGE_OBJECT_KEY = "lineage/hiring_pipeline/event_date=2026-06-12/part-0001.jsonl"
+LINEAGE_APPLIED_CDC_OBJECT_KEY = "lineage/applied_cdc_events/event_date=2026-06-12/part-0001.jsonl"
+CONTROL_PLANE_RUNTIME_HANDOFF_OBJECT_KEY = "control-plane/pipeline_quality_sla/event_date=2026-06-12/part-0001.jsonl"
+CONTROL_PLANE_RUNTIME_REPLAY_OBJECT_KEY_TEMPLATE = (
+    "control-plane/pipeline_quality_sla_replay/source_table={source_table}/source_lsn_to={source_lsn_to}/part-0001.jsonl"
+)
+LAKEHOUSE_SINK_EVIDENCE_FILE = ROOT / "backend" / "target" / "lakehouse-object-sink-evidence.json"
+MINIO_LIVE_PROOF_SCENARIOS = {"minio-object-sink", "minio-compose-object-sink"}
+MINIO_LIVE_EVIDENCE_LABELS = {"s3-compatible-live-endpoint", "local-minio-live-endpoint"}
+ENGINE_BOOTSTRAP_PROOF_SCENARIOS = {"iceberg-engine-bootstrap", "trino-compose-iceberg-bootstrap"}
+ENGINE_APPEND_PROOF_SCENARIOS = {"iceberg-engine-append", "trino-compose-iceberg-append"}
+ENGINE_EVIDENCE_LABELS = {"iceberg-engine-opt-in", "trino-iceberg-compose-opt-in"}
+DBT_PROJECT_DIR = ROOT / "lakehouse" / "dbt"
+DBT_PROFILES_TEMPLATE = DBT_PROJECT_DIR / "profiles.yml.template"
+MART_SQL_FILES = {
+    "mart_hiring_funnel_daily": ROOT / "lakehouse" / "marts" / "mart_hiring_funnel_daily.sql",
+    "mart_agent_task_reliability": ROOT / "lakehouse" / "marts" / "mart_agent_task_reliability.sql",
+    "mart_hiring_pipeline_lineage": ROOT / "lakehouse" / "marts" / "mart_hiring_pipeline_lineage.sql",
+}
+TABLE_NAME = "hiring_events"
+ICEBERG_SCHEMA = {
+    "type": "struct",
+    "schema-id": 0,
+    "fields": [
+        {"id": 1, "name": "event_id", "required": True, "type": "string"},
+        {"id": 2, "name": "event_date", "required": True, "type": "date"},
+        {"id": 3, "name": "source_table", "required": True, "type": "string"},
+        {"id": 4, "name": "source_primary_key", "required": True, "type": "string"},
+        {"id": 5, "name": "operation", "required": True, "type": "string"},
+        {"id": 6, "name": "stage", "required": False, "type": "string"},
+        {"id": 7, "name": "agent_task_status", "required": False, "type": "string"},
+    ],
+}
+ICEBERG_PARTITION_SPEC = {
+    "spec-id": 0,
+    "fields": [
+        {
+            "source-id": 2,
+            "field-id": 1000,
+            "name": "event_date",
+            "transform": "identity",
+        }
+    ],
+}
+ICEBERG_SORT_ORDER = {"order-id": 0, "fields": []}
+
+
+def write_proof_artifact(output_dir, scenario, proof):
+    artifact_path = output_dir / "proofs" / f"{scenario}.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    proof["proofArtifact"] = str(artifact_path)
+    artifact_path.write_text(json.dumps(proof, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return proof
+
+
+def curated_events():
+    return [
+        {
+            "eventId": "cdc_local_applicant_created",
+            "eventDate": "2026-06-09",
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": "applicant-001",
+            "operation": "c",
+            "stage": "APPLIED",
+            "agentTaskStatus": "NONE",
+        },
+        {
+            "eventId": "cdc_local_applicant_screening",
+            "eventDate": "2026-06-09",
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": "applicant-001",
+            "operation": "u",
+            "stage": "SCREENING",
+            "agentTaskStatus": "NONE",
+        },
+        {
+            "eventId": "cdc_local_agent_task_completed",
+            "eventDate": "2026-06-09",
+            "sourceTable": "agent_tasks",
+            "sourcePrimaryKey": "task-001",
+            "operation": "u",
+            "stage": "SCREENING",
+            "agentTaskStatus": "COMPLETED",
+        },
+    ]
+
+
+def write_jsonl(events, output_dir):
+    object_path = output_dir / CURATED_OBJECT_KEY
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    object_path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    return object_path
+
+
+def write_jsonl_to_key(records, output_dir, object_key):
+    object_path = output_dir / object_key
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    object_path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    return object_path
+
+
+def read_jsonl_records(path):
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return records
+
+
+def iceberg_table_root(output_dir):
+    return output_dir / "iceberg" / "warehouse" / "cdc.db" / TABLE_NAME
+
+
+def metadata_path(table_root, version):
+    return table_root / "metadata" / f"{version:05d}-{uuid.uuid4()}.metadata.json"
+
+
+def now_ms():
+    return int(datetime.now(UTC).timestamp() * 1000)
+
+
+def build_table_metadata(table_root, table_uuid, snapshots=None, current_snapshot_id=None):
+    timestamp_ms = now_ms()
+    snapshots = snapshots or []
+    metadata = {
+        "format-version": 2,
+        "table-uuid": table_uuid,
+        "location": str(table_root),
+        "last-sequence-number": len(snapshots),
+        "last-updated-ms": timestamp_ms,
+        "last-column-id": 7,
+        "current-schema-id": 0,
+        "schemas": [ICEBERG_SCHEMA],
+        "default-spec-id": 0,
+        "partition-specs": [ICEBERG_PARTITION_SPEC],
+        "last-partition-id": 1000,
+        "default-sort-order-id": 0,
+        "sort-orders": [ICEBERG_SORT_ORDER],
+        "properties": {
+            "table.name": TABLE_NAME,
+            "write.format.default": "jsonl-fixture",
+            "write.metadata.previous-versions-max": "5",
+        },
+        "snapshots": snapshots,
+        "snapshot-log": [],
+        "metadata-log": [],
+    }
+    if current_snapshot_id is not None:
+        metadata["current-snapshot-id"] = current_snapshot_id
+        metadata["snapshot-log"] = [
+            {
+                "timestamp-ms": timestamp_ms,
+                "snapshot-id": current_snapshot_id,
+            }
+        ]
+    return metadata
+
+
+def write_metadata(table_root, metadata, version):
+    path = metadata_path(table_root, version)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def mart_counts(events):
+    funnel_dates = {event["eventDate"] for event in events if event["sourceTable"] == "applicants"}
+    task_dates = {event["eventDate"] for event in events if event["sourceTable"] == "agent_tasks"}
+    stage_counts = Counter(event["stage"] for event in events if event["sourceTable"] == "applicants")
+    task_status_counts = Counter(event["agentTaskStatus"] for event in events if event["sourceTable"] == "agent_tasks")
+    return {
+        "mart_hiring_funnel_daily": max(1, len(funnel_dates) * max(1, len(stage_counts))),
+        "mart_agent_task_reliability": max(1, len(task_dates) * max(1, len(task_status_counts))),
+    }
+
+
+def write_mart_outputs(events, output_dir):
+    mart_dir = output_dir / "marts"
+    mart_dir.mkdir(parents=True, exist_ok=True)
+
+    funnel = defaultdict(Counter)
+    reliability = defaultdict(Counter)
+    for event in events:
+        if event["sourceTable"] == "applicants":
+            funnel[event["eventDate"]][event["stage"]] += 1
+        if event["sourceTable"] == "agent_tasks":
+            reliability[event["eventDate"]][event["agentTaskStatus"]] += 1
+
+    (mart_dir / "mart_hiring_funnel_daily.json").write_text(
+        json.dumps(funnel, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (mart_dir / "mart_agent_task_reliability.json").write_text(
+        json.dumps(reliability, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def validate_mart_sql_refs():
+    expectations = {
+        "mart_hiring_funnel_daily": [
+            "{{ ref('curated_hiring_events') }}",
+            "applied_events",
+            "screening_events",
+            "total_applicant_events",
+        ],
+        "mart_agent_task_reliability": [
+            "{{ ref('curated_hiring_events') }}",
+            "completed_task_events",
+            "total_task_events",
+            "completion_rate",
+        ],
+        "mart_hiring_pipeline_lineage": [
+            "{{ ref('curated_hiring_pipeline_lineage') }}",
+            "complete_lineage_applicants",
+            "applicant_only_count",
+            "lineage_completion_rate",
+        ],
+    }
+    for mart_name, expected_fragments in expectations.items():
+        path = MART_SQL_FILES[mart_name]
+        sql = path.read_text(encoding="utf-8")
+        missing = [fragment for fragment in expected_fragments if fragment not in sql]
+        if missing:
+            raise RuntimeError(f"{path} is missing expected SQL fragments: {missing}")
+    return True
+
+
+def materialize_mart_results(events):
+    funnel_by_date = defaultdict(lambda: {
+        "appliedEvents": 0,
+        "screeningEvents": 0,
+        "totalApplicantEvents": 0,
+    })
+    reliability_by_date = defaultdict(lambda: {
+        "completedTaskEvents": 0,
+        "totalTaskEvents": 0,
+    })
+
+    for event in events:
+        event_date = event["eventDate"]
+        if event["sourceTable"] == "applicants":
+            row = funnel_by_date[event_date]
+            if event["stage"] == "APPLIED":
+                row["appliedEvents"] += 1
+            if event["stage"] == "SCREENING":
+                row["screeningEvents"] += 1
+            row["totalApplicantEvents"] += 1
+        if event["sourceTable"] == "agent_tasks":
+            row = reliability_by_date[event_date]
+            if event["agentTaskStatus"] == "COMPLETED":
+                row["completedTaskEvents"] += 1
+            row["totalTaskEvents"] += 1
+
+    funnel_rows = []
+    for event_date in sorted(funnel_by_date):
+        row = {"eventDate": event_date}
+        row.update(funnel_by_date[event_date])
+        funnel_rows.append(row)
+
+    reliability_rows = []
+    for event_date in sorted(reliability_by_date):
+        counts = reliability_by_date[event_date]
+        total = counts["totalTaskEvents"]
+        completion_rate = 0 if total == 0 else counts["completedTaskEvents"] / total
+        reliability_rows.append({
+            "eventDate": event_date,
+            "completedTaskEvents": counts["completedTaskEvents"],
+            "totalTaskEvents": total,
+            "completionRate": completion_rate,
+        })
+
+    return {
+        "mart_hiring_funnel_daily": funnel_rows,
+        "mart_agent_task_reliability": reliability_rows,
+    }
+
+
+def write_mart_result_files(results, output_dir):
+    mart_dir = output_dir / "mart-result-validation" / "marts"
+    mart_dir.mkdir(parents=True, exist_ok=True)
+    result_files = {}
+    for mart_name, rows in results.items():
+        path = mart_dir / f"{mart_name}.json"
+        path.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+        result_files[mart_name] = str(path)
+    return result_files
+
+
+def mart_result_validation(output_dir):
+    events = curated_events()
+    scenario_dir = output_dir / "mart-result-validation"
+    curated_path = write_jsonl(events, scenario_dir)
+    validate_mart_sql_refs()
+    results = materialize_mart_results(events)
+    result_files = write_mart_result_files(results, output_dir)
+    proof = {
+        "scenario": "mart-result-validation",
+        "evidenceLabel": "dbt-athena-compatible-local-mart",
+        "curatedEventCount": len(events),
+        "curatedObjectPath": str(curated_path),
+        "martSqlFiles": [str(path) for path in MART_SQL_FILES.values()],
+        "sqlRefsValidated": True,
+        "martResults": results,
+        "martResultFiles": result_files,
+        "rowCounts": {mart_name: len(rows) for mart_name, rows in results.items()},
+        "notes": "Local semantic validation for dbt/Athena-compatible mart SQL. This is not Athena or dbt-athena runtime proof.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def iceberg_convergence(output_dir):
+    events = curated_events()
+    object_path = write_jsonl(events, output_dir)
+    write_mart_outputs(events, output_dir)
+    snapshot_version_id = "local-snapshot-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    proof = {
+        "scenario": "iceberg-convergence",
+        "evidenceLabel": "local-compatible",
+        "localObjectPath": str(object_path),
+        "snapshotVersionId": snapshot_version_id,
+        "curatedEventCount": len(events),
+        "martRowCounts": mart_counts(events),
+        "notes": "JSONL and mart outputs are local-compatible evidence, not real Iceberg/Athena proof.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def object_storage_sink(output_dir):
+    events = curated_events()
+    object_store_root = output_dir / "object-storage"
+    object_path = write_jsonl(events, object_store_root / DEFAULT_BUCKET)
+    proof = {
+        "scenario": "object-storage-sink",
+        "evidenceLabel": "local-s3-compatible",
+        "bucket": DEFAULT_BUCKET,
+        "objectKey": CURATED_OBJECT_KEY,
+        "s3CompatibleUri": f"s3://{DEFAULT_BUCKET}/{CURATED_OBJECT_KEY}",
+        "localObjectPath": str(object_path),
+        "objectEventCount": len(events),
+        "notes": "Local filesystem object layout mirrors an S3-compatible bucket/key. This is not a live MinIO/S3 PUT proof.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def backfill_snapshot_records():
+    return [
+        {
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": "applicant-001",
+            "emailHash": "hash_applicant_001",
+            "stage": "APPLIED",
+            "snapshotHighWatermarkLsn": 26710000,
+        },
+        {
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": "applicant-002",
+            "emailHash": "hash_applicant_002",
+            "stage": "SCREENING",
+            "snapshotHighWatermarkLsn": 26710000,
+        },
+    ]
+
+
+def backfill_cdc_events():
+    update_event = {
+        "eventId": "cdc_merge_update_applicant_001",
+        "sourceConnector": "cdc.raw",
+        "sourceSchema": "public",
+        "sourceTable": "applicants",
+        "sourcePrimaryKey": "applicant-001",
+        "sourceLsn": 26710752,
+        "eventSourceOffset": {
+            "lsn": 26710752,
+            "sequence": "[null,\"26710752\"]",
+            "txId": 761,
+        },
+        "operation": "u",
+        "after": {
+            "id": "applicant-001",
+            "emailHash": "hash_applicant_001",
+            "stage": "OFFER",
+        },
+    }
+    duplicate_update = dict(update_event)
+    duplicate_update["eventSourceOffset"] = dict(update_event["eventSourceOffset"])
+    return [
+        update_event,
+        duplicate_update,
+        {
+            "eventId": "cdc_merge_delete_applicant_002",
+            "sourceConnector": "cdc.raw",
+            "sourceSchema": "public",
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": "applicant-002",
+            "sourceLsn": 26711320,
+            "eventSourceOffset": {
+                "lsn": 26711320,
+                "sequence": "[\"26711320\",\"26711320\"]",
+                "txId": 762,
+            },
+            "operation": "d",
+            "after": None,
+        },
+        {
+            "eventId": "cdc_merge_create_applicant_003",
+            "sourceConnector": "cdc.raw",
+            "sourceSchema": "public",
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": "applicant-003",
+            "sourceLsn": 26711584,
+            "eventSourceOffset": {
+                "lsn": 26711584,
+                "sequence": "[\"26711584\",\"26711584\"]",
+                "txId": 763,
+            },
+            "operation": "c",
+            "after": {
+                "id": "applicant-003",
+                "emailHash": "hash_applicant_003",
+                "stage": "APPLIED",
+            },
+        },
+    ]
+
+
+def backfill_merge_key_basis(event):
+    return "|".join([
+        str(event["sourceConnector"]),
+        str(event["sourceTable"]),
+        str(event["sourcePrimaryKey"]),
+        str(event["sourceLsn"]),
+        str(event["operation"]),
+        str(event["eventId"]),
+    ])
+
+
+def backfill_merge_key(event):
+    basis = backfill_merge_key_basis(event)
+    return "sha256:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def backfill_cdc_merge(output_dir):
+    snapshot_high_watermark_lsn = 26710000
+    snapshot_records = backfill_snapshot_records()
+    cdc_events = backfill_cdc_events()
+    current_state = {
+        record["sourcePrimaryKey"]: {
+            "sourceTable": record["sourceTable"],
+            "sourcePrimaryKey": record["sourcePrimaryKey"],
+            "emailHash": record["emailHash"],
+            "stage": record["stage"],
+            "snapshotHighWatermarkLsn": snapshot_high_watermark_lsn,
+            "lastSourceLsn": snapshot_high_watermark_lsn,
+            "lastEventId": None,
+        }
+        for record in snapshot_records
+    }
+    seen_merge_keys = set()
+    merge_key_basis = {}
+    applied_events = []
+    suppressed_duplicate_event_ids = []
+    deleted_primary_keys = []
+
+    for event in cdc_events:
+        if event["sourceLsn"] <= snapshot_high_watermark_lsn:
+            continue
+        key = backfill_merge_key(event)
+        basis = backfill_merge_key_basis(event)
+        merge_key_basis[key] = basis
+        if key in seen_merge_keys:
+            suppressed_duplicate_event_ids.append(event["eventId"])
+            continue
+        seen_merge_keys.add(key)
+        applied_event = {
+            **event,
+            "mergeIdempotencyKey": key,
+            "mergeIdempotencyKeyBasis": basis,
+        }
+        applied_events.append(applied_event)
+        primary_key = event["sourcePrimaryKey"]
+        if event["operation"] == "d":
+            current_state.pop(primary_key, None)
+            deleted_primary_keys.append(primary_key)
+            continue
+        after = event["after"]
+        current_state[primary_key] = {
+            "sourceTable": event["sourceTable"],
+            "sourcePrimaryKey": primary_key,
+            "emailHash": after["emailHash"],
+            "stage": after["stage"],
+            "snapshotHighWatermarkLsn": snapshot_high_watermark_lsn,
+            "lastSourceLsn": event["sourceLsn"],
+            "lastEventId": event["eventId"],
+            "lastEventSourceOffset": event["eventSourceOffset"],
+        }
+
+    merged_records = [
+        current_state[primary_key]
+        for primary_key in sorted(current_state)
+    ]
+    object_root = output_dir / "object-storage" / DEFAULT_BUCKET
+    merged_path = write_jsonl_to_key(merged_records, object_root, BACKFILL_MERGED_OBJECT_KEY)
+    applied_cdc_path = write_jsonl_to_key(applied_events, object_root, BACKFILL_APPLIED_CDC_OBJECT_KEY)
+    source_lsn = [event["sourceLsn"] for event in applied_events]
+    event_ids = [event["eventId"] for event in applied_events]
+    proof = {
+        "scenario": "backfill-cdc-merge",
+        "evidenceLabel": "local-backfill-cdc-merge",
+        "bucket": DEFAULT_BUCKET,
+        "snapshotHighWatermarkLsn": snapshot_high_watermark_lsn,
+        "snapshotRecordCount": len(snapshot_records),
+        "cdcEventCount": len(cdc_events),
+        "appliedCdcEventCount": len(applied_events),
+        "suppressedDuplicateCount": len(suppressed_duplicate_event_ids),
+        "suppressedDuplicateEventIds": suppressed_duplicate_event_ids,
+        "deletedRecordCount": len(deleted_primary_keys),
+        "deletedPrimaryKeys": deleted_primary_keys,
+        "mergedRecordCount": len(merged_records),
+        "sourceLsn": source_lsn,
+        "sourceLsnFrom": min(source_lsn),
+        "sourceLsnTo": max(source_lsn),
+        "eventIds": event_ids,
+        "eventSourceOffset": [event["eventSourceOffset"] for event in applied_events],
+        "mergeIdempotencyKeys": [event["mergeIdempotencyKey"] for event in applied_events],
+        "mergeIdempotencyKeyBasis": merge_key_basis,
+        "mergedObjectKey": BACKFILL_MERGED_OBJECT_KEY,
+        "mergedS3CompatibleUri": f"s3://{DEFAULT_BUCKET}/{BACKFILL_MERGED_OBJECT_KEY}",
+        "mergedLocalObjectPath": str(merged_path),
+        "appliedCdcObjectKey": BACKFILL_APPLIED_CDC_OBJECT_KEY,
+        "appliedCdcS3CompatibleUri": f"s3://{DEFAULT_BUCKET}/{BACKFILL_APPLIED_CDC_OBJECT_KEY}",
+        "appliedCdcLocalObjectPath": str(applied_cdc_path),
+        "notes": (
+            "Local Backfill + CDC merge proof. Snapshot rows are merged with CDC events above the snapshot high watermark. "
+            "Duplicate CDC suppression is based on source metadata, not wall-clock time. "
+            "This is not live MinIO/S3, Iceberg engine, Athena, or dbt-athena proof."
+        ),
+    }
+    proof = write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def multi_table_lineage_cdc_events():
+    evaluation_event = {
+        "eventId": "cdc_lineage_evaluation_010_created",
+        "sourceConnector": "cdc.raw",
+        "sourceSchema": "public",
+        "sourceTable": "evaluations",
+        "sourcePrimaryKey": "eval-010",
+        "sourceLsn": 26720300,
+        "eventSourceOffset": {
+            "lsn": 26720300,
+            "sequence": "[\"26720300\",\"26720300\"]",
+            "txId": 843,
+        },
+        "operation": "c",
+        "after": {
+            "id": "eval-010",
+            "applicantId": "applicant-010",
+            "jobPostingId": "job-001",
+            "score": 92,
+            "result": "PASS",
+        },
+    }
+    duplicate_evaluation = dict(evaluation_event)
+    duplicate_evaluation["eventSourceOffset"] = dict(evaluation_event["eventSourceOffset"])
+    duplicate_evaluation["after"] = dict(evaluation_event["after"])
+    return [
+        {
+            "eventId": "cdc_lineage_job_posting_created",
+            "sourceConnector": "cdc.raw",
+            "sourceSchema": "public",
+            "sourceTable": "job_postings",
+            "sourcePrimaryKey": "job-001",
+            "sourceLsn": 26720000,
+            "eventSourceOffset": {
+                "lsn": 26720000,
+                "sequence": "[null,\"26720000\"]",
+                "txId": 840,
+            },
+            "operation": "c",
+            "after": {
+                "id": "job-001",
+                "title": "Backend Platform Engineer",
+                "department": "Platform",
+            },
+        },
+        {
+            "eventId": "cdc_lineage_applicant_010_created",
+            "sourceConnector": "cdc.raw",
+            "sourceSchema": "public",
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": "applicant-010",
+            "sourceLsn": 26720100,
+            "eventSourceOffset": {
+                "lsn": 26720100,
+                "sequence": "[\"26720100\",\"26720100\"]",
+                "txId": 841,
+            },
+            "operation": "c",
+            "after": {
+                "id": "applicant-010",
+                "jobPostingId": "job-001",
+                "emailHash": "hash_applicant_010",
+                "stage": "APPLIED",
+            },
+        },
+        {
+            "eventId": "cdc_lineage_applicant_010_screening",
+            "sourceConnector": "cdc.raw",
+            "sourceSchema": "public",
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": "applicant-010",
+            "sourceLsn": 26720200,
+            "eventSourceOffset": {
+                "lsn": 26720200,
+                "sequence": "[\"26720200\",\"26720200\"]",
+                "txId": 842,
+            },
+            "operation": "u",
+            "after": {
+                "id": "applicant-010",
+                "jobPostingId": "job-001",
+                "emailHash": "hash_applicant_010",
+                "stage": "SCREENING",
+            },
+        },
+        evaluation_event,
+        duplicate_evaluation,
+        {
+            "eventId": "cdc_lineage_agent_task_010_completed",
+            "sourceConnector": "cdc.raw",
+            "sourceSchema": "public",
+            "sourceTable": "agent_tasks",
+            "sourcePrimaryKey": "task-010",
+            "sourceLsn": 26720400,
+            "eventSourceOffset": {
+                "lsn": 26720400,
+                "sequence": "[\"26720400\",\"26720400\"]",
+                "txId": 844,
+            },
+            "operation": "u",
+            "after": {
+                "id": "task-010",
+                "applicantId": "applicant-010",
+                "evaluationId": "eval-010",
+                "status": "COMPLETED",
+            },
+        },
+        {
+            "eventId": "cdc_lineage_applicant_011_created",
+            "sourceConnector": "cdc.raw",
+            "sourceSchema": "public",
+            "sourceTable": "applicants",
+            "sourcePrimaryKey": "applicant-011",
+            "sourceLsn": 26720500,
+            "eventSourceOffset": {
+                "lsn": 26720500,
+                "sequence": "[\"26720500\",\"26720500\"]",
+                "txId": 845,
+            },
+            "operation": "c",
+            "after": {
+                "id": "applicant-011",
+                "jobPostingId": "job-001",
+                "emailHash": "hash_applicant_011",
+                "stage": "APPLIED",
+            },
+        },
+    ]
+
+
+def lineage_key_basis(event):
+    return "|".join([
+        str(event["sourceConnector"]),
+        str(event["sourceTable"]),
+        str(event["sourcePrimaryKey"]),
+        str(event["sourceLsn"]),
+        str(event["operation"]),
+        str(event["eventId"]),
+    ])
+
+
+def lineage_idempotency_key(event):
+    basis = lineage_key_basis(event)
+    return "sha256:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def lineage_source_metadata(event):
+    return {
+        "sourceTable": event["sourceTable"],
+        "sourcePrimaryKey": event["sourcePrimaryKey"],
+        "sourceLsn": event["sourceLsn"],
+        "eventSourceOffset": event["eventSourceOffset"],
+        "eventId": event["eventId"],
+        "operation": event["operation"],
+    }
+
+
+def first_record_by(records, field_name, value):
+    for record in sorted(records, key=lambda item: item["id"]):
+        if record.get(field_name) == value:
+            return record
+    return None
+
+
+def build_multi_table_cdc_lineage(output_dir):
+    cdc_events = multi_table_lineage_cdc_events()
+    table_state = {
+        "agent_tasks": {},
+        "applicants": {},
+        "evaluations": {},
+        "job_postings": {},
+    }
+    seen_keys = set()
+    key_basis = {}
+    applied_events = []
+    suppressed_duplicate_event_ids = []
+
+    for event in cdc_events:
+        key = lineage_idempotency_key(event)
+        basis = lineage_key_basis(event)
+        key_basis[key] = basis
+        if key in seen_keys:
+            suppressed_duplicate_event_ids.append(event["eventId"])
+            continue
+        seen_keys.add(key)
+        applied_event = {
+            **event,
+            "lineageIdempotencyKey": key,
+            "lineageIdempotencyKeyBasis": basis,
+        }
+        applied_events.append(applied_event)
+        table = event["sourceTable"]
+        primary_key = event["sourcePrimaryKey"]
+        if event["operation"] == "d":
+            table_state[table].pop(primary_key, None)
+            continue
+        table_state[table][primary_key] = {
+            **event["after"],
+            "_sourceMetadata": lineage_source_metadata(event),
+        }
+
+    lineage_rows = []
+    applicants = table_state["applicants"]
+    job_postings = table_state["job_postings"]
+    evaluations = list(table_state["evaluations"].values())
+    agent_tasks = list(table_state["agent_tasks"].values())
+    for applicant_id in sorted(applicants):
+        applicant = applicants[applicant_id]
+        job_posting = job_postings.get(applicant.get("jobPostingId"))
+        evaluation = first_record_by(evaluations, "applicantId", applicant_id)
+        agent_task = first_record_by(agent_tasks, "applicantId", applicant_id)
+        if job_posting and evaluation and agent_task:
+            lineage_status = "COMPLETE"
+        elif job_posting:
+            lineage_status = "APPLICANT_ONLY"
+        else:
+            lineage_status = "SOURCE_INCOMPLETE"
+        lineage_rows.append({
+            "eventDate": "2026-06-12",
+            "applicantId": applicant_id,
+            "jobPostingId": applicant.get("jobPostingId"),
+            "jobTitle": job_posting.get("title") if job_posting else None,
+            "applicantStage": applicant.get("stage"),
+            "evaluationId": evaluation.get("id") if evaluation else None,
+            "evaluationScore": evaluation.get("score") if evaluation else None,
+            "evaluationResult": evaluation.get("result") if evaluation else None,
+            "agentTaskId": agent_task.get("id") if agent_task else None,
+            "agentTaskStatus": agent_task.get("status") if agent_task else None,
+            "lineageStatus": lineage_status,
+            "sourceLineage": {
+                "job_postings": job_posting.get("_sourceMetadata") if job_posting else None,
+                "applicants": applicant.get("_sourceMetadata"),
+                "evaluations": evaluation.get("_sourceMetadata") if evaluation else None,
+                "agent_tasks": agent_task.get("_sourceMetadata") if agent_task else None,
+            },
+        })
+
+    object_root = output_dir / "object-storage" / DEFAULT_BUCKET
+    lineage_path = write_jsonl_to_key(lineage_rows, object_root, LINEAGE_OBJECT_KEY)
+    applied_cdc_path = write_jsonl_to_key(applied_events, object_root, LINEAGE_APPLIED_CDC_OBJECT_KEY)
+    source_lsn = [event["sourceLsn"] for event in applied_events]
+    event_ids = [event["eventId"] for event in applied_events]
+    source_tables = sorted({event["sourceTable"] for event in cdc_events})
+    proof = {
+        "scenario": "multi-table-cdc-lineage",
+        "evidenceLabel": "local-multi-table-cdc-lineage",
+        "bucket": DEFAULT_BUCKET,
+        "sourceTables": source_tables,
+        "sourceTableCounts": dict(sorted(Counter(event["sourceTable"] for event in applied_events).items())),
+        "rawCdcEventCount": len(cdc_events),
+        "appliedCdcEventCount": len(applied_events),
+        "suppressedDuplicateCount": len(suppressed_duplicate_event_ids),
+        "suppressedDuplicateEventIds": suppressed_duplicate_event_ids,
+        "lineageRecordCount": len(lineage_rows),
+        "lineageCompleteRecordCount": sum(1 for row in lineage_rows if row["lineageStatus"] == "COMPLETE"),
+        "sourceLsn": source_lsn,
+        "sourceLsnFrom": min(source_lsn),
+        "sourceLsnTo": max(source_lsn),
+        "eventIds": event_ids,
+        "eventSourceOffset": [event["eventSourceOffset"] for event in applied_events],
+        "lineageIdempotencyKeys": [event["lineageIdempotencyKey"] for event in applied_events],
+        "lineageIdempotencyKeyBasis": key_basis,
+        "lineageObjectKey": LINEAGE_OBJECT_KEY,
+        "lineageS3CompatibleUri": f"s3://{DEFAULT_BUCKET}/{LINEAGE_OBJECT_KEY}",
+        "lineageLocalObjectPath": str(lineage_path),
+        "appliedCdcObjectKey": LINEAGE_APPLIED_CDC_OBJECT_KEY,
+        "appliedCdcS3CompatibleUri": f"s3://{DEFAULT_BUCKET}/{LINEAGE_APPLIED_CDC_OBJECT_KEY}",
+        "appliedCdcLocalObjectPath": str(applied_cdc_path),
+        "notes": (
+            "Local multi-table CDC lineage proof. Events from job_postings, applicants, evaluations, and agent_tasks "
+            "are joined into applicant-centered lineage rows. Duplicate CDC suppression is based on source metadata, "
+            "not wall-clock time. This is not live MinIO/S3, Iceberg engine, Athena, or dbt-athena proof."
+        ),
+    }
+    proof = write_proof_artifact(output_dir, proof["scenario"], proof)
+    return proof, lineage_rows, applied_events
+
+
+def multi_table_cdc_lineage(output_dir):
+    proof, _lineage_rows, _applied_events = build_multi_table_cdc_lineage(output_dir)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def materialize_lineage_mart_results(lineage_rows):
+    grouped = defaultdict(lambda: {
+        "applicantIds": set(),
+        "completeLineageApplicants": 0,
+        "applicantOnlyCount": 0,
+        "passedEvaluations": 0,
+        "completedAgentTasks": 0,
+    })
+    for row in lineage_rows:
+        key = (row["eventDate"], row["jobPostingId"], row["jobTitle"])
+        group = grouped[key]
+        group["applicantIds"].add(row["applicantId"])
+        if row["lineageStatus"] == "COMPLETE":
+            group["completeLineageApplicants"] += 1
+        if row["lineageStatus"] == "APPLICANT_ONLY":
+            group["applicantOnlyCount"] += 1
+        if row["evaluationResult"] == "PASS":
+            group["passedEvaluations"] += 1
+        if row["agentTaskStatus"] == "COMPLETED":
+            group["completedAgentTasks"] += 1
+
+    mart_rows = []
+    for event_date, job_posting_id, job_title in sorted(grouped):
+        counts = grouped[(event_date, job_posting_id, job_title)]
+        total_applicants = len(counts["applicantIds"])
+        completion_rate = 0 if total_applicants == 0 else counts["completeLineageApplicants"] / total_applicants
+        mart_rows.append({
+            "eventDate": event_date,
+            "jobPostingId": job_posting_id,
+            "jobTitle": job_title,
+            "totalApplicants": total_applicants,
+            "completeLineageApplicants": counts["completeLineageApplicants"],
+            "applicantOnlyCount": counts["applicantOnlyCount"],
+            "passedEvaluations": counts["passedEvaluations"],
+            "completedAgentTasks": counts["completedAgentTasks"],
+            "lineageCompletionRate": completion_rate,
+        })
+    return {
+        "mart_hiring_pipeline_lineage": mart_rows,
+    }
+
+
+def write_lineage_mart_result_files(results, output_dir):
+    mart_dir = output_dir / "mart-lineage-validation" / "marts"
+    mart_dir.mkdir(parents=True, exist_ok=True)
+    result_files = {}
+    for mart_name, rows in results.items():
+        path = mart_dir / f"{mart_name}.json"
+        path.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+        result_files[mart_name] = str(path)
+    return result_files
+
+
+def mart_lineage_validation(output_dir):
+    lineage_proof, lineage_rows, _applied_events = build_multi_table_cdc_lineage(output_dir)
+    validate_mart_sql_refs()
+    results = materialize_lineage_mart_results(lineage_rows)
+    result_files = write_lineage_mart_result_files(results, output_dir)
+    proof = {
+        "scenario": "mart-lineage-validation",
+        "evidenceLabel": "dbt-athena-compatible-local-lineage-mart",
+        "sourceProofScenario": lineage_proof["scenario"],
+        "sourceProofArtifact": lineage_proof["proofArtifact"],
+        "sourceEvidenceLabel": lineage_proof["evidenceLabel"],
+        "sourceTables": lineage_proof["sourceTables"],
+        "lineageRecordCount": lineage_proof["lineageRecordCount"],
+        "lineageCompleteRecordCount": lineage_proof["lineageCompleteRecordCount"],
+        "sourceLsn": lineage_proof["sourceLsn"],
+        "sourceLsnFrom": lineage_proof["sourceLsnFrom"],
+        "sourceLsnTo": lineage_proof["sourceLsnTo"],
+        "eventSourceOffset": lineage_proof["eventSourceOffset"],
+        "eventIds": lineage_proof["eventIds"],
+        "lineageIdempotencyKeys": lineage_proof["lineageIdempotencyKeys"],
+        "martSqlFile": str(MART_SQL_FILES["mart_hiring_pipeline_lineage"]),
+        "sqlRefsValidated": True,
+        "martResults": results,
+        "martResultFiles": result_files,
+        "rowCounts": {mart_name: len(rows) for mart_name, rows in results.items()},
+        "notes": (
+            "Local semantic validation for the dbt/Athena-compatible hiring pipeline lineage mart. "
+            "This reuses local multi-table CDC lineage proof and does not call AWS Athena or dbt-athena."
+        ),
+    }
+    proof = write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def require_control_plane_runtime_record(output_dir):
+    artifact_path = output_dir / "proofs" / "quality-sla-runtime-record.json"
+    if not artifact_path.exists():
+        raise RuntimeError(
+            "quality-sla-runtime-record.json is required for control-plane runtime SLA "
+            "lakehouse handoff; run `./tools/runner/control-plane-smoke quality-sla-runtime-record` first."
+        )
+    proof = json.loads(artifact_path.read_text(encoding="utf-8"))
+    return artifact_path, proof
+
+
+def control_plane_runtime_handoff(output_dir):
+    source_artifact, runtime_record = require_control_plane_runtime_record(output_dir)
+    event_ids = runtime_record.get("eventIds") or runtime_record.get("eventId") or []
+    object_root = output_dir / "object-storage" / DEFAULT_BUCKET
+    handoff_record = {
+        "recordType": "pipeline_quality_sla_runtime",
+        "sourceProofScenario": runtime_record["scenario"],
+        "sourceProofArtifact": str(source_artifact),
+        "sourceEvidenceLabel": runtime_record["evidenceLabel"],
+        "runtimeEvidenceLabel": runtime_record.get("runtimeEvidenceLabel"),
+        "checkName": runtime_record["checkName"],
+        "sourceTable": runtime_record["sourceTable"],
+        "sourcePrimaryKey": runtime_record["sourcePrimaryKey"],
+        "slaStatus": runtime_record["slaStatus"],
+        "completenessRatio": runtime_record["completenessRatio"],
+        "duplicateRatio": runtime_record["duplicateRatio"],
+        "freshnessLagMillis": runtime_record["freshnessLagMillis"],
+        "lagMillis": runtime_record["lagMillis"],
+        "missingEventCount": runtime_record["missingEventCount"],
+        "duplicateEventCount": runtime_record["duplicateEventCount"],
+        "violatedSloIds": runtime_record["violatedSloIds"],
+        "warningSloIds": runtime_record["warningSloIds"],
+        "sourceLsn": runtime_record["sourceLsn"],
+        "sourceLsnFrom": runtime_record["sourceLsnFrom"],
+        "sourceLsnTo": runtime_record["sourceLsnTo"],
+        "eventSourceOffset": runtime_record["eventSourceOffset"],
+        "eventIds": event_ids,
+        "sourceOffset": runtime_record.get("sourceOffset", {}),
+    }
+    object_path = write_jsonl_to_key(
+        [handoff_record],
+        object_root,
+        CONTROL_PLANE_RUNTIME_HANDOFF_OBJECT_KEY,
+    )
+    proof = {
+        "scenario": "control-plane-runtime-handoff",
+        "evidenceLabel": "local-control-plane-runtime-lakehouse-handoff",
+        "sourceProofScenario": runtime_record["scenario"],
+        "sourceProofArtifact": str(source_artifact),
+        "sourceEvidenceLabel": runtime_record["evidenceLabel"],
+        "runtimeEvidenceLabel": runtime_record.get("runtimeEvidenceLabel"),
+        "bucket": DEFAULT_BUCKET,
+        "objectKey": CONTROL_PLANE_RUNTIME_HANDOFF_OBJECT_KEY,
+        "s3CompatibleUri": f"s3://{DEFAULT_BUCKET}/{CONTROL_PLANE_RUNTIME_HANDOFF_OBJECT_KEY}",
+        "localObjectPath": str(object_path),
+        "objectRecordCount": 1,
+        "checkName": runtime_record["checkName"],
+        "sourceTable": runtime_record["sourceTable"],
+        "sourcePrimaryKey": runtime_record["sourcePrimaryKey"],
+        "slaStatus": runtime_record["slaStatus"],
+        "sourceLsn": runtime_record["sourceLsn"],
+        "sourceLsnFrom": runtime_record["sourceLsnFrom"],
+        "sourceLsnTo": runtime_record["sourceLsnTo"],
+        "eventSourceOffset": runtime_record["eventSourceOffset"],
+        "eventIds": event_ids,
+        "warningSloIds": runtime_record["warningSloIds"],
+        "notes": (
+            "Local lakehouse-compatible handoff of persisted control-plane runtime SLA evidence. "
+            "This is not live MinIO/S3, Iceberg engine, Athena, or dbt-athena proof."
+        ),
+    }
+    proof = write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def require_control_plane_runtime_handoff(output_dir):
+    artifact_path = output_dir / "proofs" / "control-plane-runtime-handoff.json"
+    if not artifact_path.exists():
+        raise RuntimeError(
+            "control-plane-runtime-handoff.json is required for runtime lakehouse replay; "
+            "run `./tools/runner/lakehouse-smoke control-plane-runtime-handoff` first."
+        )
+    proof = json.loads(artifact_path.read_text(encoding="utf-8"))
+    object_path = Path(proof.get("localObjectPath", ""))
+    if not object_path.is_absolute():
+        object_path = output_dir / object_path
+    if not object_path.exists():
+        raise RuntimeError(f"handoff localObjectPath is required for runtime lakehouse replay: {object_path}")
+    return artifact_path, object_path, proof
+
+
+def event_ids_from_record(record):
+    event_ids = record.get("eventIds") or record.get("eventId") or []
+    if isinstance(event_ids, str):
+        return [event_ids]
+    return list(event_ids)
+
+
+def runtime_replay_key_basis(record):
+    event_ids = event_ids_from_record(record)
+    return "|".join([
+        str(record["sourceProofScenario"]),
+        str(record["checkName"]),
+        str(record["sourceTable"]),
+        str(record["sourcePrimaryKey"]),
+        str(record["sourceLsnFrom"]),
+        str(record["sourceLsnTo"]),
+        ",".join(event_ids),
+    ])
+
+
+def runtime_replay_key(record):
+    basis = runtime_replay_key_basis(record)
+    return "sha256:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def partition_value(value):
+    return str(value).replace("/", "_").replace(" ", "_")
+
+
+def runtime_lakehouse_replay(output_dir):
+    source_artifact, handoff_object_path, handoff_proof = require_control_plane_runtime_handoff(output_dir)
+    handoff_records = read_jsonl_records(handoff_object_path)
+    if not handoff_records:
+        raise RuntimeError(f"handoff object has no records for runtime lakehouse replay: {handoff_object_path}")
+
+    replay_inputs = handoff_records + handoff_records
+    replayed_records = []
+    seen_keys = set()
+    suppressed_duplicate_keys = []
+    idempotency_key_basis = {}
+    for record in replay_inputs:
+        key = runtime_replay_key(record)
+        basis = runtime_replay_key_basis(record)
+        idempotency_key_basis[key] = basis
+        if key in seen_keys:
+            suppressed_duplicate_keys.append(key)
+            continue
+        seen_keys.add(key)
+        replayed_records.append({
+            "recordType": "pipeline_quality_sla_runtime_replay",
+            "replayDecision": "REPLAYED",
+            "replayIdempotencyKey": key,
+            "replayIdempotencyKeyBasis": basis,
+            "sourceHandoffObjectPath": str(handoff_object_path),
+            "sourceProofScenario": handoff_proof["scenario"],
+            "sourceProofArtifact": str(source_artifact),
+            "checkName": record["checkName"],
+            "sourceTable": record["sourceTable"],
+            "sourcePrimaryKey": record["sourcePrimaryKey"],
+            "slaStatus": record["slaStatus"],
+            "sourceLsn": record["sourceLsn"],
+            "sourceLsnFrom": record["sourceLsnFrom"],
+            "sourceLsnTo": record["sourceLsnTo"],
+            "eventSourceOffset": record["eventSourceOffset"],
+            "eventIds": event_ids_from_record(record),
+            "warningSloIds": record.get("warningSloIds", []),
+            "sourceOffset": record.get("sourceOffset", {}),
+        })
+
+    first_record = replayed_records[0]
+    object_key = CONTROL_PLANE_RUNTIME_REPLAY_OBJECT_KEY_TEMPLATE.format(
+        source_table=partition_value(first_record["sourceTable"]),
+        source_lsn_to=partition_value(first_record["sourceLsnTo"]),
+    )
+    object_root = output_dir / "object-storage" / DEFAULT_BUCKET
+    replay_object_path = write_jsonl_to_key(replayed_records, object_root, object_key)
+    proof = {
+        "scenario": "runtime-lakehouse-replay",
+        "evidenceLabel": "local-runtime-lakehouse-replay",
+        "sourceProofScenario": handoff_proof["scenario"],
+        "sourceHandoffArtifact": str(source_artifact),
+        "sourceHandoffObjectPath": str(handoff_object_path),
+        "sourceHandoffObjectKey": handoff_proof.get("objectKey"),
+        "bucket": DEFAULT_BUCKET,
+        "objectKey": object_key,
+        "s3CompatibleUri": f"s3://{DEFAULT_BUCKET}/{object_key}",
+        "localObjectPath": str(replay_object_path),
+        "handoffRecordCount": len(handoff_records),
+        "replayAttemptCount": 2,
+        "inputRecordCount": len(replay_inputs),
+        "replayedRecordCount": len(replayed_records),
+        "suppressedDuplicateCount": len(suppressed_duplicate_keys),
+        "idempotencyKeyBasis": idempotency_key_basis,
+        "idempotencyKeys": [record["replayIdempotencyKey"] for record in replayed_records],
+        "suppressedDuplicateKeys": suppressed_duplicate_keys,
+        "checkName": first_record["checkName"],
+        "sourceTable": first_record["sourceTable"],
+        "sourcePrimaryKey": first_record["sourcePrimaryKey"],
+        "slaStatus": first_record["slaStatus"],
+        "sourceLsn": first_record["sourceLsn"],
+        "sourceLsnFrom": first_record["sourceLsnFrom"],
+        "sourceLsnTo": first_record["sourceLsnTo"],
+        "eventSourceOffset": first_record["eventSourceOffset"],
+        "eventIds": first_record["eventIds"],
+        "warningSloIds": first_record["warningSloIds"],
+        "notes": (
+            "Local replay proof for a persisted control-plane runtime SLA handoff object. "
+            "Replay duplicate suppression is based on source metadata, not wall-clock time. "
+            "This is not live MinIO/S3, Iceberg engine, Athena, or dbt-athena proof."
+        ),
+    }
+    proof = write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def canonical_object_sink(output_dir):
+    object_output_dir = output_dir / "object-storage"
+    if LAKEHOUSE_SINK_EVIDENCE_FILE.exists():
+        LAKEHOUSE_SINK_EVIDENCE_FILE.unlink()
+
+    command = [
+        "mvn",
+        "-q",
+        "-f",
+        "backend/pom.xml",
+        "-Dtest=LocalLakehouseObjectSinkTest",
+        f"-Dlakehouse.object.outputDir={object_output_dir}",
+        "test",
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        env=os.environ.copy(),
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "canonical object sink verification failed\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    if not LAKEHOUSE_SINK_EVIDENCE_FILE.exists():
+        raise RuntimeError(f"missing evidence file: {LAKEHOUSE_SINK_EVIDENCE_FILE}")
+
+    proof = json.loads(LAKEHOUSE_SINK_EVIDENCE_FILE.read_text())
+    proof["verificationCommand"] = " ".join(command)
+    proof["notes"] = (
+        "Backend local filesystem object sink evidence preserving source offset, source LSN, "
+        "and source metadata event id. This is not live MinIO/S3 or Iceberg engine proof."
+    )
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def canonical_s3_event():
+    return {
+        "eventId": "cdc_c17221c61d9646622322f39090f950c9afcba798",
+        "eventDate": "2026-06-09",
+        "sourceConnector": "cdc.raw",
+        "sourceSchema": "public",
+        "sourceTable": "applicants",
+        "sourcePrimaryKey": "19c14e85-9840-7a5a-bb16-3c7f70547d9f",
+        "sourceLsn": 88432240,
+        "eventSourceOffset": {
+            "lsn": 88432240,
+            "sequence": ["26740416", "26740416"],
+            "txId": 773,
+        },
+        "operation": "u",
+        "after": {
+            "id": "19c14e85-9840-7a5a-bb16-3c7f70547d9f",
+            "stage": "SCREENING",
+        },
+    }
+
+
+def signing_key(secret_key, date_stamp, region, service):
+    date_key = hmac.new(("AWS4" + secret_key).encode("utf-8"), date_stamp.encode("utf-8"), hashlib.sha256).digest()
+    region_key = hmac.new(date_key, region.encode("utf-8"), hashlib.sha256).digest()
+    service_key = hmac.new(region_key, service.encode("utf-8"), hashlib.sha256).digest()
+    return hmac.new(service_key, b"aws4_request", hashlib.sha256).digest()
+
+
+def signed_s3_put_headers(endpoint, bucket, object_key, body, access_key, secret_key, region, request_time):
+    parsed = urlparse(endpoint)
+    host = parsed.netloc
+    service = "s3"
+    date_stamp = request_time.strftime("%Y%m%d")
+    amz_date = request_time.strftime("%Y%m%dT%H%M%SZ")
+    payload_hash = hashlib.sha256(body).hexdigest()
+    canonical_uri = "/" + bucket
+    if object_key:
+        canonical_uri += "/" + quote(object_key, safe="/")
+    canonical_headers = (
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_request = "\n".join([
+        "PUT",
+        canonical_uri,
+        "",
+        canonical_headers,
+        signed_headers,
+        payload_hash,
+    ])
+    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256",
+        amz_date,
+        credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+    signature = hmac.new(
+        signing_key(secret_key, date_stamp, region, service),
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    authorization = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return {
+        "Authorization": authorization,
+        "Host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+        "Content-Type": "application/x-ndjson",
+    }
+
+
+def required_env(name):
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is required for minio-object-sink")
+    return value
+
+
+def live_s3_config():
+    return {
+        "endpoint": required_env("CDC_LAKEHOUSE_S3_ENDPOINT").rstrip("/"),
+        "accessKey": required_env("CDC_LAKEHOUSE_S3_ACCESS_KEY"),
+        "secretKey": required_env("CDC_LAKEHOUSE_S3_SECRET_KEY"),
+        "bucket": os.environ.get("CDC_LAKEHOUSE_S3_BUCKET", DEFAULT_BUCKET),
+        "region": os.environ.get("CDC_LAKEHOUSE_S3_REGION", "us-east-1"),
+        "createBucket": os.environ.get("CDC_LAKEHOUSE_S3_CREATE_BUCKET", "true").lower() != "false",
+    }
+
+
+def signed_put(endpoint, bucket, object_key, body, access_key, secret_key, region, request_time):
+    headers = signed_s3_put_headers(
+        endpoint,
+        bucket,
+        object_key,
+        body,
+        access_key,
+        secret_key,
+        region,
+        request_time,
+    )
+    url = f"{endpoint}/{bucket}/{quote(object_key, safe='/')}"
+    request = Request(url, data=body, headers=headers, method="PUT")
+    with urlopen(request, timeout=10) as response:
+        return {
+            "status": response.status,
+            "headers": headers,
+        }
+
+
+def signed_bucket_put(endpoint, bucket, access_key, secret_key, region, request_time):
+    headers = signed_s3_put_headers(
+        endpoint,
+        bucket,
+        "",
+        b"",
+        access_key,
+        secret_key,
+        region,
+        request_time,
+    )
+    url = f"{endpoint}/{bucket}"
+    request = Request(url, data=b"", headers=headers, method="PUT")
+    try:
+        with urlopen(request, timeout=10) as response:
+            return {
+                "status": response.status,
+                "headers": headers,
+            }
+    except HTTPError as exc:
+        if exc.code == 409:
+            return {
+                "status": exc.code,
+                "headers": headers,
+            }
+        raise
+
+
+def minio_object_sink_proof(output_dir):
+    config = live_s3_config()
+    event = canonical_s3_event()
+    body = (json.dumps(event, sort_keys=True) + "\n").encode("utf-8")
+    artifact_path = output_dir / "minio-object-sink" / config["bucket"] / CURATED_OBJECT_KEY
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_bytes(body)
+    request_time = datetime.now(UTC)
+    put_count = 0
+    if config["createBucket"]:
+        signed_bucket_put(
+            config["endpoint"],
+            config["bucket"],
+            config["accessKey"],
+            config["secretKey"],
+            config["region"],
+            request_time,
+        )
+        put_count += 1
+    object_result = signed_put(
+        config["endpoint"],
+        config["bucket"],
+        CURATED_OBJECT_KEY,
+        body,
+        config["accessKey"],
+        config["secretKey"],
+        config["region"],
+        request_time,
+    )
+    put_count += 1
+    proof = {
+        "scenario": "minio-object-sink",
+        "evidenceLabel": "s3-compatible-live-endpoint",
+        "endpoint": config["endpoint"],
+        "httpMethod": "PUT",
+        "httpStatus": object_result["status"],
+        "bucket": config["bucket"],
+        "objectKey": CURATED_OBJECT_KEY,
+        "s3CompatibleUri": f"s3://{config['bucket']}/{CURATED_OBJECT_KEY}",
+        "authorizationHeader": object_result["headers"].get("Authorization"),
+        "payloadSha256": object_result["headers"].get("x-amz-content-sha256"),
+        "localObjectPath": str(artifact_path),
+        "putRequestCount": put_count,
+        "objectEventCount": 1,
+        "eventId": event["eventId"],
+        "sourceLsn": event["sourceLsn"],
+        "eventSourceOffset": event["eventSourceOffset"],
+        "notes": "Signed PUT to configured S3-compatible endpoint. Use a local MinIO endpoint for live local proof; actual AWS remains opt-in.",
+    }
+    return write_proof_artifact(output_dir, proof["scenario"], proof)
+
+
+def minio_object_sink(output_dir):
+    proof = minio_object_sink_proof(output_dir)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def s3_compatible_put_fixture(output_dir):
+    requests = []
+
+    class FakeS3Handler(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            length = int(self.headers.get("content-length", "0"))
+            body = self.rfile.read(length)
+            requests.append({
+                "method": "PUT",
+                "path": self.path,
+                "headers": {key.lower(): value for key, value in self.headers.items()},
+                "body": body,
+            })
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+        def log_message(self, format, *args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeS3Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        event = canonical_s3_event()
+        body = (json.dumps(event, sort_keys=True) + "\n").encode("utf-8")
+        artifact_path = output_dir / "s3-compatible-put-fixture" / DEFAULT_BUCKET / CURATED_OBJECT_KEY
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(body)
+        headers = signed_s3_put_headers(
+            endpoint,
+            DEFAULT_BUCKET,
+            CURATED_OBJECT_KEY,
+            body,
+            "minioadmin",
+            "minioadmin",
+            "us-east-1",
+            datetime(2026, 6, 9, 4, 0, 0, tzinfo=UTC),
+        )
+        url = f"{endpoint}/{DEFAULT_BUCKET}/{quote(CURATED_OBJECT_KEY, safe='/')}"
+        request = Request(url, data=body, headers=headers, method="PUT")
+        with urlopen(request, timeout=10) as response:
+            status_code = response.status
+
+        if not requests:
+            raise RuntimeError("fake S3 endpoint did not receive a PUT request")
+        received = requests[0]
+        received_event = json.loads(received["body"].decode("utf-8").strip())
+        proof = {
+            "scenario": "s3-compatible-put-fixture",
+            "evidenceLabel": "s3-compatible-signed-put-fixture",
+            "httpMethod": received["method"],
+            "httpStatus": status_code,
+            "bucket": DEFAULT_BUCKET,
+            "objectKey": CURATED_OBJECT_KEY,
+            "s3CompatibleUri": f"s3://{DEFAULT_BUCKET}/{CURATED_OBJECT_KEY}",
+            "authorizationHeader": received["headers"].get("authorization"),
+            "payloadSha256": received["headers"].get("x-amz-content-sha256"),
+            "localObjectPath": str(artifact_path),
+            "putRequestCount": len(requests),
+            "objectEventCount": 1,
+            "eventId": received_event["eventId"],
+            "sourceLsn": received_event["sourceLsn"],
+            "eventSourceOffset": received_event["eventSourceOffset"],
+            "notes": "Signed PUT fixture against a local fake S3-compatible endpoint. This is not live MinIO/S3 proof.",
+        }
+        print(json.dumps(proof, indent=2, sort_keys=True))
+    finally:
+        server.server_close()
+
+
+def iceberg_metadata_bootstrap(output_dir):
+    table_root = iceberg_table_root(output_dir)
+    table_uuid = str(uuid.uuid4())
+    metadata = build_table_metadata(table_root, table_uuid)
+    path = write_metadata(table_root, metadata, 1)
+    proof = {
+        "scenario": "iceberg-metadata-bootstrap",
+        "evidenceLabel": "local-iceberg-metadata",
+        "tableName": TABLE_NAME,
+        "formatVersion": metadata["format-version"],
+        "tableUuid": table_uuid,
+        "metadataFile": str(path),
+        "snapshotCount": len(metadata["snapshots"]),
+        "notes": "Local Iceberg metadata JSON shaped from the Apache Iceberg table metadata spec. This is not validated by an Iceberg engine.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def iceberg_append_fixture(output_dir):
+    table_root = iceberg_table_root(output_dir)
+    table_uuid = str(uuid.uuid4())
+    events = curated_events()
+    data_file = write_jsonl(events, table_root / "data")
+    snapshot_id = int(datetime.now(UTC).timestamp() * 1000)
+    snapshot = {
+        "snapshot-id": snapshot_id,
+        "sequence-number": 1,
+        "timestamp-ms": now_ms(),
+        "manifest-list": str(table_root / "metadata" / f"snap-{snapshot_id}-0-manifest-list.avro"),
+        "summary": {
+            "operation": "append",
+            "added-data-files": "1",
+            "added-records": str(len(events)),
+            "changed-partition-count": "1",
+        },
+        "schema-id": 0,
+    }
+    metadata = build_table_metadata(table_root, table_uuid, snapshots=[snapshot], current_snapshot_id=snapshot_id)
+    path = write_metadata(table_root, metadata, 2)
+    proof = {
+        "scenario": "iceberg-append-fixture",
+        "evidenceLabel": "local-iceberg-metadata",
+        "tableName": TABLE_NAME,
+        "tableUuid": table_uuid,
+        "metadataFile": str(path),
+        "dataFile": str(data_file),
+        "currentSnapshotId": snapshot_id,
+        "snapshotCount": len(metadata["snapshots"]),
+        "appendedRecordCount": len(events),
+        "notes": "Local metadata and JSONL append fixture. This is not Parquet/Avro manifest generation and not Iceberg engine proof.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def iceberg_table_identifier():
+    namespace = os.environ.get("CDC_LAKEHOUSE_ICEBERG_NAMESPACE", "cdc")
+    table = os.environ.get("CDC_LAKEHOUSE_ICEBERG_TABLE", TABLE_NAME)
+    return f"{namespace}.{table}"
+
+
+def required_engine_command():
+    command = os.environ.get("CDC_LAKEHOUSE_ICEBERG_ENGINE_CMD")
+    if not command:
+        raise RuntimeError("CDC_LAKEHOUSE_ICEBERG_ENGINE_CMD is required for Iceberg engine-backed runners")
+    return shlex.split(command)
+
+
+def sql_string(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def build_iceberg_create_table_sql(table_identifier):
+    return "\n".join([
+        f"CREATE TABLE IF NOT EXISTS {table_identifier}",
+        "(",
+        "  event_id STRING,",
+        "  event_date DATE,",
+        "  source_table STRING,",
+        "  source_primary_key STRING,",
+        "  operation STRING,",
+        "  stage STRING,",
+        "  agent_task_status STRING",
+        ")",
+        "USING iceberg",
+        "PARTITIONED BY (event_date);",
+        "",
+    ])
+
+
+def build_iceberg_insert_sql(table_identifier, events):
+    rows = []
+    for event in events:
+        rows.append(
+            "("
+            + ", ".join([
+                sql_string(event["eventId"]),
+                f"DATE {sql_string(event['eventDate'])}",
+                sql_string(event["sourceTable"]),
+                sql_string(event["sourcePrimaryKey"]),
+                sql_string(event["operation"]),
+                sql_string(event["stage"]),
+                sql_string(event["agentTaskStatus"]),
+            ])
+            + ")"
+        )
+    return "\n".join([
+        f"INSERT INTO {table_identifier}",
+        "VALUES",
+        ",\n".join(rows) + ";",
+        "",
+    ])
+
+
+def trino_iceberg_catalog():
+    return os.environ.get("CDC_LAKEHOUSE_TRINO_CATALOG", "iceberg")
+
+
+def trino_iceberg_schema():
+    return os.environ.get("CDC_LAKEHOUSE_ICEBERG_NAMESPACE", "cdc")
+
+
+def trino_iceberg_table():
+    return os.environ.get("CDC_LAKEHOUSE_ICEBERG_TABLE", TABLE_NAME)
+
+
+def trino_iceberg_table_identifier():
+    return f"{trino_iceberg_catalog()}.{trino_iceberg_schema()}.{trino_iceberg_table()}"
+
+
+def trino_iceberg_warehouse_location():
+    bucket = os.environ.get("CDC_LAKEHOUSE_S3_BUCKET", DEFAULT_BUCKET)
+    return f"s3://{bucket}/warehouse/{trino_iceberg_schema()}"
+
+
+def build_trino_iceberg_create_table_sql(table_identifier):
+    catalog, schema, _table = table_identifier.split(".", 2)
+    return "\n".join([
+        f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}",
+        f"WITH (location = {sql_string(trino_iceberg_warehouse_location())});",
+        "",
+        f"CREATE TABLE IF NOT EXISTS {table_identifier}",
+        "(",
+        "  event_id VARCHAR,",
+        "  event_date DATE,",
+        "  source_table VARCHAR,",
+        "  source_primary_key VARCHAR,",
+        "  operation VARCHAR,",
+        "  stage VARCHAR,",
+        "  agent_task_status VARCHAR",
+        ")",
+        "WITH (",
+        "  format = 'PARQUET',",
+        "  format_version = 2,",
+        "  partitioning = ARRAY['event_date']",
+        ");",
+        "",
+    ])
+
+
+def build_trino_iceberg_insert_sql(table_identifier, events):
+    rows = []
+    for event in events:
+        rows.append(
+            "("
+            + ", ".join([
+                sql_string(event["eventId"]),
+                f"DATE {sql_string(event['eventDate'])}",
+                sql_string(event["sourceTable"]),
+                sql_string(event["sourcePrimaryKey"]),
+                sql_string(event["operation"]),
+                sql_string(event["stage"]),
+                sql_string(event["agentTaskStatus"]),
+            ])
+            + ")"
+        )
+    return "\n".join([
+        f"INSERT INTO {table_identifier}",
+        "VALUES",
+        ",\n".join(rows) + ";",
+        "",
+    ])
+
+
+def run_iceberg_engine(sql):
+    command = required_engine_command()
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        input=sql,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Iceberg engine command failed\n"
+            f"command: {' '.join(command)}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    return {
+        "command": command,
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+        "exitCode": completed.returncode,
+    }
+
+
+def iceberg_engine_bootstrap(output_dir):
+    table_identifier = iceberg_table_identifier()
+    sql = build_iceberg_create_table_sql(table_identifier)
+    sql_path = output_dir / "iceberg-engine" / "bootstrap.sql"
+    sql_path.parent.mkdir(parents=True, exist_ok=True)
+    sql_path.write_text(sql, encoding="utf-8")
+    result = run_iceberg_engine(sql)
+    proof = {
+        "scenario": "iceberg-engine-bootstrap",
+        "evidenceLabel": "iceberg-engine-opt-in",
+        "tableIdentifier": table_identifier,
+        "sqlFile": str(sql_path),
+        "engineCommand": result["command"],
+        "engineExitCode": result["exitCode"],
+        "engineStdout": result["stdout"],
+        "engineStderr": result["stderr"],
+        "notes": "Executed generated Iceberg table bootstrap SQL through the configured opt-in engine command.",
+    }
+    write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def iceberg_engine_append(output_dir):
+    table_identifier = iceberg_table_identifier()
+    events = curated_events()
+    data_file = write_jsonl(events, output_dir / "iceberg-engine" / "data")
+    sql = build_iceberg_insert_sql(table_identifier, events)
+    sql_path = output_dir / "iceberg-engine" / "append.sql"
+    sql_path.parent.mkdir(parents=True, exist_ok=True)
+    sql_path.write_text(sql, encoding="utf-8")
+    result = run_iceberg_engine(sql)
+    proof = {
+        "scenario": "iceberg-engine-append",
+        "evidenceLabel": "iceberg-engine-opt-in",
+        "tableIdentifier": table_identifier,
+        "sqlFile": str(sql_path),
+        "dataFile": str(data_file),
+        "appendedRecordCount": len(events),
+        "engineCommand": result["command"],
+        "engineExitCode": result["exitCode"],
+        "engineStdout": result["stdout"],
+        "engineStderr": result["stderr"],
+        "notes": "Executed generated Iceberg append SQL through the configured opt-in engine command.",
+    }
+    write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def command_path(command):
+    return shutil.which(command)
+
+
+def run_command(command, check=True):
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        raise RuntimeError(
+            "command failed\n"
+            f"command: {' '.join(command)}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    return completed
+
+
+def docker_status():
+    docker_path = command_path("docker")
+    status = {
+        "cliAvailable": docker_path is not None,
+        "cliPath": docker_path,
+        "daemonResponsive": False,
+        "serverVersion": None,
+        "error": None,
+    }
+    if not docker_path:
+        status["error"] = "docker CLI not found on PATH"
+        return status
+
+    completed = subprocess.run(
+        [docker_path, "version", "--format", "{{.Server.Version}}"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode == 0:
+        status["daemonResponsive"] = True
+        status["serverVersion"] = completed.stdout.strip()
+        return status
+
+    status["error"] = (completed.stderr or completed.stdout).strip()
+    return status
+
+
+def require_docker_cli():
+    docker_path = command_path("docker")
+    if not docker_path:
+        raise RuntimeError("docker CLI is required for minio-compose-object-sink")
+    return docker_path
+
+
+def require_local_image(docker_path, image):
+    completed = run_command([docker_path, "image", "inspect", image], check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"local MinIO image {image} is required before minio-compose-object-sink runs. "
+            "Docker pull/setup is opt-in; prepare the image explicitly, then rerun this scenario."
+        )
+
+
+def require_local_docker_images(docker_path, images, scenario):
+    for image in images:
+        completed = run_command([docker_path, "image", "inspect", image], check=False)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"local Docker image {image} is required before {scenario} runs. "
+                "Docker pull/setup is opt-in; prepare the image explicitly, then rerun this scenario."
+            )
+
+
+def local_compose_file():
+    return Path(os.environ.get("CDC_LAKEHOUSE_COMPOSE_FILE", str(DEFAULT_LOCAL_COMPOSE_FILE)))
+
+
+def local_compose_project():
+    return os.environ.get("CDC_LAKEHOUSE_COMPOSE_PROJECT", DEFAULT_COMPOSE_PROJECT)
+
+
+def compose_command(docker_path):
+    return [
+        docker_path,
+        "compose",
+        "--project-name",
+        local_compose_project(),
+        "-f",
+        str(local_compose_file()),
+    ]
+
+
+def compose_service_exists(docker_path, service):
+    completed = run_command(compose_command(docker_path) + ["ps", "-q", service], check=False)
+    return completed.returncode == 0 and bool(completed.stdout.strip())
+
+
+def wait_for_minio_health(endpoint):
+    timeout_seconds = float(os.environ.get("CDC_LAKEHOUSE_MINIO_START_TIMEOUT_SECONDS", "30"))
+    health_url = os.environ.get("CDC_LAKEHOUSE_MINIO_HEALTH_URL", endpoint.rstrip("/") + "/minio/health/ready")
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            request = Request(health_url, method="GET")
+            with urlopen(request, timeout=2) as response:
+                if 200 <= response.status < 500:
+                    return {"url": health_url, "status": response.status}
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(0.5)
+    raise RuntimeError(f"MinIO health endpoint did not become ready: {health_url}; lastError={last_error}")
+
+
+def wait_for_trino_health():
+    if os.environ.get("CDC_LAKEHOUSE_TRINO_HEALTH_CHECK", "true").lower() == "false":
+        return {"url": None, "status": "skipped"}
+    timeout_seconds = float(os.environ.get("CDC_LAKEHOUSE_TRINO_START_TIMEOUT_SECONDS", "45"))
+    health_url = os.environ.get("CDC_LAKEHOUSE_TRINO_HEALTH_URL", "http://127.0.0.1:8080/v1/info")
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            request = Request(health_url, method="GET")
+            with urlopen(request, timeout=2) as response:
+                if 200 <= response.status < 500:
+                    return {"url": health_url, "status": response.status}
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(0.5)
+    raise RuntimeError(f"Trino health endpoint did not become ready: {health_url}; lastError={last_error}")
+
+
+def restore_environment(original_values):
+    for key, value in original_values.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def minio_compose_object_sink(output_dir):
+    docker_path = require_docker_cli()
+    image = os.environ.get("CDC_LAKEHOUSE_MINIO_IMAGE", DEFAULT_MINIO_IMAGE)
+    require_local_image(docker_path, image)
+
+    service = os.environ.get("CDC_LAKEHOUSE_MINIO_SERVICE", "minio")
+    endpoint = os.environ.get("CDC_LAKEHOUSE_S3_ENDPOINT", "http://127.0.0.1:9000")
+    started_before = compose_service_exists(docker_path, service)
+    started_by_runner = not started_before
+    cleanup_enabled = os.environ.get("CDC_LAKEHOUSE_MINIO_COMPOSE_KEEP", "false").lower() != "true"
+    cleanup_performed = False
+
+    run_command(compose_command(docker_path) + ["up", "-d", "--no-deps", "--pull", "never", service])
+    health = wait_for_minio_health(endpoint)
+
+    keys = [
+        "CDC_LAKEHOUSE_S3_ENDPOINT",
+        "CDC_LAKEHOUSE_S3_ACCESS_KEY",
+        "CDC_LAKEHOUSE_S3_SECRET_KEY",
+        "CDC_LAKEHOUSE_S3_BUCKET",
+        "CDC_LAKEHOUSE_S3_REGION",
+    ]
+    original_values = {key: os.environ.get(key) for key in keys}
+    os.environ["CDC_LAKEHOUSE_S3_ENDPOINT"] = endpoint
+    os.environ.setdefault("CDC_LAKEHOUSE_S3_ACCESS_KEY", "minioadmin")
+    os.environ.setdefault("CDC_LAKEHOUSE_S3_SECRET_KEY", "minioadmin")
+    os.environ.setdefault("CDC_LAKEHOUSE_S3_BUCKET", DEFAULT_BUCKET)
+    os.environ.setdefault("CDC_LAKEHOUSE_S3_REGION", "us-east-1")
+    try:
+        proof = minio_object_sink_proof(output_dir)
+    finally:
+        restore_environment(original_values)
+        if cleanup_enabled and started_by_runner:
+            run_command(compose_command(docker_path) + ["rm", "-sf", service])
+            cleanup_performed = True
+
+    proof["scenario"] = "minio-compose-object-sink"
+    proof["evidenceLabel"] = "local-minio-live-endpoint"
+    proof["compose"] = {
+        "projectName": local_compose_project(),
+        "composeFile": str(local_compose_file()),
+        "service": service,
+        "image": image,
+        "pullPolicy": "never",
+        "startedByRunner": started_by_runner,
+        "cleanupPerformed": cleanup_performed,
+        "healthUrl": health["url"],
+        "healthStatus": health["status"],
+    }
+    proof["notes"] = (
+        "Started local MinIO through Docker Compose with --pull never and wrote a signed object. "
+        "This is local MinIO proof only; actual AWS remains opt-in."
+    )
+    write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def trino_compose_services():
+    return ["iceberg-catalog-postgres", "minio", "trino"]
+
+
+def start_trino_iceberg_stack(docker_path, scenario):
+    images = [
+        os.environ.get("CDC_LAKEHOUSE_ICEBERG_CATALOG_POSTGRES_IMAGE", DEFAULT_ICEBERG_CATALOG_POSTGRES_IMAGE),
+        os.environ.get("CDC_LAKEHOUSE_MINIO_IMAGE", DEFAULT_MINIO_IMAGE),
+        os.environ.get("CDC_LAKEHOUSE_TRINO_IMAGE", DEFAULT_TRINO_IMAGE),
+    ]
+    require_local_docker_images(docker_path, images, scenario)
+    services = trino_compose_services()
+    started_before = {service: compose_service_exists(docker_path, service) for service in services}
+    stack = {
+        "services": services,
+        "images": images,
+        "startedBefore": started_before,
+    }
+    try:
+        run_command(compose_command(docker_path) + ["up", "-d", "--no-deps", "--pull", "never"] + services)
+        stack["health"] = wait_for_trino_health()
+        return stack
+    except Exception:
+        cleanup_trino_iceberg_stack(docker_path, stack)
+        raise
+
+
+def cleanup_trino_iceberg_stack(docker_path, stack):
+    cleanup_enabled = os.environ.get("CDC_LAKEHOUSE_TRINO_COMPOSE_KEEP", "false").lower() != "true"
+    if not cleanup_enabled:
+        return []
+    cleanup_services = [
+        service
+        for service in reversed(stack["services"])
+        if not stack["startedBefore"].get(service, False)
+    ]
+    if cleanup_services:
+        run_command(compose_command(docker_path) + ["rm", "-sf"] + cleanup_services)
+    return cleanup_services
+
+
+def trino_statement_endpoint():
+    return os.environ.get("CDC_LAKEHOUSE_TRINO_QUERY_ENDPOINT", "http://127.0.0.1:8080/v1/statement")
+
+
+def trino_request_json(url, method="GET", body=None):
+    headers = {
+        "X-Trino-User": os.environ.get("CDC_LAKEHOUSE_TRINO_QUERY_USER", "cdc_local"),
+        "X-Trino-Source": "cdc-data-platform-lakehouse-smoke",
+    }
+    data = None
+    if body is not None:
+        data = body.encode("utf-8")
+        headers["Content-Type"] = "text/plain; charset=utf-8"
+    request = Request(url, data=data, headers=headers, method=method)
+    with urlopen(request, timeout=float(os.environ.get("CDC_LAKEHOUSE_TRINO_QUERY_TIMEOUT_SECONDS", "30"))) as response:
+        payload = response.read().decode("utf-8")
+        return {
+            "status": response.status,
+            "payload": json.loads(payload) if payload else {},
+        }
+
+
+def run_trino_sql(_docker_path, sql):
+    endpoint = trino_statement_endpoint()
+    poll_seconds = float(os.environ.get("CDC_LAKEHOUSE_TRINO_QUERY_POLL_SECONDS", "0.25"))
+    max_polls = int(os.environ.get("CDC_LAKEHOUSE_TRINO_QUERY_MAX_POLLS", "120"))
+    retry_seconds = float(os.environ.get("CDC_LAKEHOUSE_TRINO_QUERY_RETRY_SECONDS", "1"))
+    max_attempts = int(os.environ.get("CDC_LAKEHOUSE_TRINO_QUERY_MAX_ATTEMPTS", "30"))
+    responses = []
+    for attempt in range(max_attempts):
+        responses = [trino_request_json(endpoint, method="POST", body=sql)]
+        for _ in range(max_polls):
+            payload = responses[-1]["payload"]
+            if "error" in payload:
+                error = payload["error"]
+                if error.get("errorName") == "SERVER_STARTING_UP" and attempt < max_attempts - 1:
+                    time.sleep(retry_seconds)
+                    break
+                raise RuntimeError(
+                    "Trino statement failed\n"
+                    f"endpoint: {endpoint}\n"
+                    f"message: {error.get('message')}\n"
+                    f"errorCode: {error.get('errorCode')}\n"
+                    f"errorName: {error.get('errorName')}"
+                )
+            state = payload.get("stats", {}).get("state")
+            next_uri = payload.get("nextUri")
+            if state in {"FINISHED", "FAILED", "CANCELED"} or not next_uri:
+                if state in {"FAILED", "CANCELED"}:
+                    raise RuntimeError(f"Trino statement ended with state={state}; endpoint={endpoint}")
+                break
+            time.sleep(poll_seconds)
+            responses.append(trino_request_json(next_uri))
+        else:
+            raise RuntimeError(f"Trino statement did not finish after {max_polls} polls; endpoint={endpoint}")
+
+        payload = responses[-1]["payload"]
+        if payload.get("error", {}).get("errorName") == "SERVER_STARTING_UP":
+            continue
+        break
+    else:
+        raise RuntimeError(f"Trino server did not become query-ready after {max_attempts} attempts; endpoint={endpoint}")
+
+    final_payload = responses[-1]["payload"]
+    return {
+        "command": ["POST", endpoint],
+        "stdout": json.dumps(final_payload, sort_keys=True),
+        "stderr": "",
+        "exitCode": 0,
+    }
+
+
+def trino_compose_iceberg_bootstrap(output_dir):
+    docker_path = require_docker_cli()
+    scenario = "trino-compose-iceberg-bootstrap"
+    table_identifier = trino_iceberg_table_identifier()
+    sql = build_trino_iceberg_create_table_sql(table_identifier)
+    sql_path = output_dir / "trino-iceberg" / "bootstrap.sql"
+    sql_path.parent.mkdir(parents=True, exist_ok=True)
+    sql_path.write_text(sql, encoding="utf-8")
+    stack = start_trino_iceberg_stack(docker_path, scenario)
+    cleanup_services = []
+    try:
+        result = run_trino_sql(docker_path, sql)
+    finally:
+        cleanup_services = cleanup_trino_iceberg_stack(docker_path, stack)
+    proof = {
+        "scenario": scenario,
+        "evidenceLabel": "trino-iceberg-compose-opt-in",
+        "tableIdentifier": table_identifier,
+        "warehouseLocation": trino_iceberg_warehouse_location(),
+        "sqlFile": str(sql_path),
+        "engineCommand": result["command"],
+        "engineExitCode": result["exitCode"],
+        "engineStdout": result["stdout"],
+        "engineStderr": result["stderr"],
+        "compose": {
+            "projectName": local_compose_project(),
+            "composeFile": str(local_compose_file()),
+            "services": stack["services"],
+            "images": stack["images"],
+            "pullPolicy": "never",
+            "startedBefore": stack["startedBefore"],
+            "cleanupServices": cleanup_services,
+            "health": stack["health"],
+        },
+        "notes": "Executed Trino Iceberg CREATE SCHEMA/TABLE SQL through the local Compose Trino service with --pull never.",
+    }
+    write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def trino_compose_iceberg_append(output_dir):
+    docker_path = require_docker_cli()
+    scenario = "trino-compose-iceberg-append"
+    table_identifier = trino_iceberg_table_identifier()
+    events = curated_events()
+    data_file = write_jsonl(events, output_dir / "trino-iceberg" / "data")
+    sql = build_trino_iceberg_insert_sql(table_identifier, events)
+    sql_path = output_dir / "trino-iceberg" / "append.sql"
+    sql_path.parent.mkdir(parents=True, exist_ok=True)
+    sql_path.write_text(sql, encoding="utf-8")
+    stack = start_trino_iceberg_stack(docker_path, scenario)
+    cleanup_services = []
+    try:
+        result = run_trino_sql(docker_path, sql)
+    finally:
+        cleanup_services = cleanup_trino_iceberg_stack(docker_path, stack)
+    proof = {
+        "scenario": scenario,
+        "evidenceLabel": "trino-iceberg-compose-opt-in",
+        "tableIdentifier": table_identifier,
+        "warehouseLocation": trino_iceberg_warehouse_location(),
+        "sqlFile": str(sql_path),
+        "dataFile": str(data_file),
+        "appendedRecordCount": len(events),
+        "engineCommand": result["command"],
+        "engineExitCode": result["exitCode"],
+        "engineStdout": result["stdout"],
+        "engineStderr": result["stderr"],
+        "compose": {
+            "projectName": local_compose_project(),
+            "composeFile": str(local_compose_file()),
+            "services": stack["services"],
+            "images": stack["images"],
+            "pullPolicy": "never",
+            "startedBefore": stack["startedBefore"],
+            "cleanupServices": cleanup_services,
+            "health": stack["health"],
+        },
+        "notes": "Executed Trino Iceberg INSERT SQL through the local Compose Trino service with --pull never.",
+    }
+    write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def render_athena_mart_sql(sql):
+    return (
+        sql
+        .replace("{{ ref('curated_hiring_events') }}", "curated_hiring_events")
+        .replace("{{ ref('curated_hiring_pipeline_lineage') }}", "curated_hiring_pipeline_lineage")
+    )
+
+
+def build_athena_curated_table_ddl():
+    location = os.environ.get(
+        "CDC_LAKEHOUSE_ATHENA_CURATED_LOCATION",
+        "<set-s3-curated-hiring-events-location>",
+    )
+    return "\n".join([
+        "CREATE EXTERNAL TABLE IF NOT EXISTS curated_hiring_events (",
+        "  event_id string,",
+        "  event_date date,",
+        "  source_table string,",
+        "  source_primary_key string,",
+        "  operation string,",
+        "  stage string,",
+        "  agent_task_status string",
+        ")",
+        "STORED AS PARQUET",
+        f"LOCATION {sql_string(location)};",
+        "",
+    ])
+
+
+def build_athena_lineage_table_ddl():
+    location = os.environ.get(
+        "CDC_LAKEHOUSE_ATHENA_LINEAGE_LOCATION",
+        "<set-s3-hiring-pipeline-lineage-location>",
+    )
+    return "\n".join([
+        "CREATE EXTERNAL TABLE IF NOT EXISTS hiring_pipeline_lineage (",
+        "  event_date date,",
+        "  applicant_id string,",
+        "  job_posting_id string,",
+        "  job_title string,",
+        "  applicant_stage string,",
+        "  evaluation_id string,",
+        "  evaluation_score int,",
+        "  evaluation_result string,",
+        "  agent_task_id string,",
+        "  agent_task_status string,",
+        "  lineage_status string",
+        ")",
+        "STORED AS PARQUET",
+        f"LOCATION {sql_string(location)};",
+        "",
+    ])
+
+
+def write_athena_query_plan(output_dir):
+    scenario_dir = output_dir / "athena-mart-query-plan"
+    ddl_dir = scenario_dir / "ddl"
+    mart_dir = scenario_dir / "marts"
+    ddl_dir.mkdir(parents=True, exist_ok=True)
+    mart_dir.mkdir(parents=True, exist_ok=True)
+
+    ddl_path = ddl_dir / "curated_hiring_events.sql"
+    ddl_path.write_text(build_athena_curated_table_ddl(), encoding="utf-8")
+    lineage_ddl_path = ddl_dir / "hiring_pipeline_lineage.sql"
+    lineage_ddl_path.write_text(build_athena_lineage_table_ddl(), encoding="utf-8")
+
+    query_files = []
+    mart_files = []
+    for mart_name, source_path in MART_SQL_FILES.items():
+        rendered = render_athena_mart_sql(source_path.read_text(encoding="utf-8"))
+        query_path = mart_dir / f"{mart_name}.sql"
+        query_path.write_text(rendered, encoding="utf-8")
+        query_files.append(query_path)
+        mart_files.append(source_path)
+
+    return {
+        "curatedTableDdlFile": ddl_path,
+        "lineageTableDdlFile": lineage_ddl_path,
+        "athenaQueryFiles": query_files,
+        "martSqlFiles": mart_files,
+    }
+
+
+def athena_mart_query_plan(output_dir):
+    plan = write_athena_query_plan(output_dir)
+    proof = {
+        "scenario": "athena-mart-query-plan",
+        "evidenceLabel": "athena-dbt-opt-in-plan",
+        "curatedTableDdlFile": str(plan["curatedTableDdlFile"]),
+        "lineageTableDdlFile": str(plan["lineageTableDdlFile"]),
+        "athenaQueryFiles": [str(path) for path in plan["athenaQueryFiles"]],
+        "martSqlFiles": [str(path) for path in plan["martSqlFiles"]],
+        "dbtProjectDir": str(DBT_PROJECT_DIR),
+        "profilesTemplate": str(DBT_PROFILES_TEMPLATE),
+        "notes": (
+            "Generated Athena-compatible SQL from dbt-style mart SQL. "
+            "This does not call AWS Athena or dbt-athena."
+        ),
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def required_athena_execution_config():
+    if not truthy_env("CDC_LAKEHOUSE_ATHENA_OPT_IN"):
+        raise RuntimeError(
+            "CDC_LAKEHOUSE_ATHENA_OPT_IN=true is required before running Athena mart execution"
+        )
+    database = os.environ.get("CDC_LAKEHOUSE_ATHENA_DATABASE")
+    output_location = os.environ.get("CDC_LAKEHOUSE_ATHENA_OUTPUT_LOCATION")
+    if not database:
+        raise RuntimeError("CDC_LAKEHOUSE_ATHENA_DATABASE is required for Athena mart execution")
+    if not output_location:
+        raise RuntimeError("CDC_LAKEHOUSE_ATHENA_OUTPUT_LOCATION is required for Athena mart execution")
+    aws_path = command_path("aws")
+    if not aws_path:
+        raise RuntimeError("aws CLI is required for Athena mart execution")
+    return {
+        "awsPath": aws_path,
+        "database": database,
+        "outputLocation": output_location,
+        "workgroup": os.environ.get("CDC_LAKEHOUSE_ATHENA_WORKGROUP", "primary"),
+        "catalog": os.environ.get("CDC_LAKEHOUSE_ATHENA_CATALOG", "AwsDataCatalog"),
+        "pollSeconds": float(os.environ.get("CDC_LAKEHOUSE_ATHENA_POLL_SECONDS", "2")),
+        "maxPolls": int(os.environ.get("CDC_LAKEHOUSE_ATHENA_MAX_POLLS", "30")),
+    }
+
+
+def run_aws_json(command):
+    completed = run_command(command, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "AWS CLI command failed\n"
+            f"command: {' '.join(command)}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    try:
+        return json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"AWS CLI returned non-JSON output: {completed.stdout}") from exc
+
+
+def start_athena_query(config, sql):
+    response = run_aws_json([
+        config["awsPath"],
+        "athena",
+        "start-query-execution",
+        "--query-string",
+        sql,
+        "--work-group",
+        config["workgroup"],
+        "--query-execution-context",
+        f"Database={config['database']},Catalog={config['catalog']}",
+        "--result-configuration",
+        f"OutputLocation={config['outputLocation']}",
+    ])
+    query_execution_id = response.get("QueryExecutionId")
+    if not query_execution_id:
+        raise RuntimeError(f"Athena start-query-execution response missing QueryExecutionId: {response}")
+    return query_execution_id
+
+
+def get_athena_query_execution(config, query_execution_id):
+    return run_aws_json([
+        config["awsPath"],
+        "athena",
+        "get-query-execution",
+        "--query-execution-id",
+        query_execution_id,
+    ])
+
+
+def wait_for_athena_query(config, query_execution_id):
+    last_response = None
+    for _attempt in range(config["maxPolls"]):
+        last_response = get_athena_query_execution(config, query_execution_id)
+        query = last_response.get("QueryExecution", {})
+        status = query.get("Status", {})
+        state = status.get("State")
+        if state == "SUCCEEDED":
+            return {
+                "queryExecutionId": query_execution_id,
+                "state": state,
+                "outputLocation": query.get("ResultConfiguration", {}).get("OutputLocation"),
+            }
+        if state in {"FAILED", "CANCELLED"}:
+            raise RuntimeError(
+                f"Athena query {query_execution_id} ended with state {state}: "
+                f"{status.get('StateChangeReason')}"
+            )
+        if config["pollSeconds"] > 0:
+            time.sleep(config["pollSeconds"])
+    raise RuntimeError(f"Athena query {query_execution_id} did not finish: {last_response}")
+
+
+def athena_mart_execution(output_dir):
+    config = required_athena_execution_config()
+    plan = write_athena_query_plan(output_dir)
+    query_executions = []
+    for query_path in plan["athenaQueryFiles"]:
+        sql = query_path.read_text(encoding="utf-8")
+        query_execution_id = start_athena_query(config, sql)
+        query_result = wait_for_athena_query(config, query_execution_id)
+        query_result["queryFile"] = str(query_path)
+        query_executions.append(query_result)
+
+    proof = {
+        "scenario": "athena-mart-execution",
+        "evidenceLabel": "athena-cli-opt-in",
+        "athenaDatabase": config["database"],
+        "athenaCatalog": config["catalog"],
+        "athenaWorkgroup": config["workgroup"],
+        "athenaOutputLocation": config["outputLocation"],
+        "curatedTableDdlFile": str(plan["curatedTableDdlFile"]),
+        "lineageTableDdlFile": str(plan["lineageTableDdlFile"]),
+        "athenaQueryFiles": [str(path) for path in plan["athenaQueryFiles"]],
+        "queryExecutions": query_executions,
+        "notes": "Executed mart SELECT SQL through the AWS Athena CLI after explicit opt-in.",
+    }
+    write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def prepare_dbt_profiles_dir(output_dir):
+    profiles_dir = Path(
+        os.environ.get(
+            "CDC_LAKEHOUSE_DBT_PROFILES_DIR",
+            str(output_dir / "dbt-athena-run" / "profiles"),
+        )
+    )
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    target_profile = profiles_dir / "profiles.yml"
+    target_profile.write_text(DBT_PROFILES_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
+    return profiles_dir
+
+
+def dbt_athena_run(output_dir):
+    if not truthy_env("CDC_LAKEHOUSE_DBT_ATHENA_OPT_IN"):
+        raise RuntimeError(
+            "CDC_LAKEHOUSE_DBT_ATHENA_OPT_IN=true is required before running dbt-athena"
+        )
+    dbt_path = command_path("dbt")
+    if not dbt_path:
+        raise RuntimeError("dbt CLI is required for dbt-athena execution")
+    profiles_dir = prepare_dbt_profiles_dir(output_dir)
+    target = os.environ.get("CDC_LAKEHOUSE_DBT_TARGET", "athena")
+    command = [
+        dbt_path,
+        "run",
+        "--project-dir",
+        str(DBT_PROJECT_DIR),
+        "--profiles-dir",
+        str(profiles_dir),
+        "--target",
+        target,
+    ]
+    completed = run_command(command, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "dbt-athena run failed\n"
+            f"command: {' '.join(command)}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    proof = {
+        "scenario": "dbt-athena-run",
+        "evidenceLabel": "dbt-athena-cli-opt-in",
+        "dbtProjectDir": str(DBT_PROJECT_DIR),
+        "profilesDir": str(profiles_dir),
+        "target": target,
+        "dbtCommand": command,
+        "dbtExitCode": completed.returncode,
+        "dbtStdout": completed.stdout.strip(),
+        "dbtStderr": completed.stderr.strip(),
+        "notes": "Executed dbt run through the configured dbt CLI after explicit opt-in.",
+    }
+    write_proof_artifact(output_dir, proof["scenario"], proof)
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def proof_requirement(
+    requirement_id,
+    status,
+    evidence_level,
+    acceptable_scenarios,
+    next_action,
+    evidence_artifact=None,
+    requirement_scope="local-mvp",
+):
+    requirement = {
+        "id": requirement_id,
+        "status": status,
+        "evidenceLevel": evidence_level,
+        "acceptableScenarios": acceptable_scenarios,
+        "nextAction": next_action,
+        "requirementScope": requirement_scope,
+    }
+    if evidence_artifact:
+        requirement["evidenceArtifact"] = str(evidence_artifact)
+    return requirement
+
+
+def valid_minio_live_proof(proof):
+    source_lsn = proof.get("sourceLsn")
+    offset = proof.get("eventSourceOffset") if isinstance(proof.get("eventSourceOffset"), dict) else {}
+    offset_lsn = offset.get("lsn")
+    return (
+        proof.get("scenario") in MINIO_LIVE_PROOF_SCENARIOS
+        and proof.get("evidenceLabel") in MINIO_LIVE_EVIDENCE_LABELS
+        and proof.get("httpStatus") == 200
+        and isinstance(proof.get("eventId"), str)
+        and proof["eventId"].startswith("cdc_")
+        and source_lsn is not None
+        and offset_lsn is not None
+        and str(offset_lsn) == str(source_lsn)
+    )
+
+
+def minio_live_proof_status(output_dir):
+    for scenario in ["minio-compose-object-sink", "minio-object-sink"]:
+        artifact = output_dir / "proofs" / f"{scenario}.json"
+        if not artifact.exists():
+            continue
+        try:
+            proof = json.loads(artifact.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if valid_minio_live_proof(proof):
+            return {
+                "status": "satisfied-live-proof",
+                "artifact": artifact,
+            }
+    return {
+        "status": None,
+        "artifact": None,
+    }
+
+
+def valid_engine_bootstrap_proof(proof):
+    return (
+        proof.get("scenario") in ENGINE_BOOTSTRAP_PROOF_SCENARIOS
+        and proof.get("evidenceLabel") in ENGINE_EVIDENCE_LABELS
+        and proof.get("engineExitCode") == 0
+        and isinstance(proof.get("tableIdentifier"), str)
+        and bool(proof["tableIdentifier"])
+    )
+
+
+def valid_engine_append_proof(proof):
+    return (
+        proof.get("scenario") in ENGINE_APPEND_PROOF_SCENARIOS
+        and proof.get("evidenceLabel") in ENGINE_EVIDENCE_LABELS
+        and proof.get("engineExitCode") == 0
+        and isinstance(proof.get("tableIdentifier"), str)
+        and bool(proof["tableIdentifier"])
+        and isinstance(proof.get("appendedRecordCount"), int)
+        and proof["appendedRecordCount"] > 0
+    )
+
+
+def engine_proof_status(output_dir, proof_type):
+    if proof_type == "bootstrap":
+        scenarios = ["trino-compose-iceberg-bootstrap", "iceberg-engine-bootstrap"]
+        validator = valid_engine_bootstrap_proof
+    else:
+        scenarios = ["trino-compose-iceberg-append", "iceberg-engine-append"]
+        validator = valid_engine_append_proof
+    for scenario in scenarios:
+        artifact = output_dir / "proofs" / f"{scenario}.json"
+        if not artifact.exists():
+            continue
+        try:
+            proof = json.loads(artifact.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if validator(proof):
+            return {
+                "status": "satisfied-engine-proof",
+                "artifact": artifact,
+            }
+    return {
+        "status": None,
+        "artifact": None,
+    }
+
+
+def valid_athena_execution_proof(proof):
+    return (
+        proof.get("scenario") == "athena-mart-execution"
+        and proof.get("evidenceLabel") == "athena-cli-opt-in"
+        and isinstance(proof.get("athenaDatabase"), str)
+        and bool(proof["athenaDatabase"])
+        and isinstance(proof.get("queryExecutions"), list)
+        and len(proof["queryExecutions"]) > 0
+        and all(item.get("state") == "SUCCEEDED" for item in proof["queryExecutions"])
+    )
+
+
+def valid_dbt_athena_proof(proof):
+    return (
+        proof.get("scenario") == "dbt-athena-run"
+        and proof.get("evidenceLabel") == "dbt-athena-cli-opt-in"
+        and proof.get("dbtExitCode") == 0
+        and isinstance(proof.get("target"), str)
+        and bool(proof["target"])
+    )
+
+
+def athena_dbt_proof_status(output_dir):
+    validators = {
+        "athena-mart-execution": valid_athena_execution_proof,
+        "dbt-athena-run": valid_dbt_athena_proof,
+    }
+    for scenario, validator in validators.items():
+        artifact = output_dir / "proofs" / f"{scenario}.json"
+        if not artifact.exists():
+            continue
+        try:
+            proof = json.loads(artifact.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if validator(proof):
+            return {
+                "status": "satisfied-athena-dbt-proof",
+                "artifact": artifact,
+            }
+    return {
+        "status": None,
+        "artifact": None,
+    }
+
+
+def lakehouse_proof_audit(output_dir):
+    engine = engine_command_status()
+    s3_ready = bool(
+        os.environ.get("CDC_LAKEHOUSE_S3_ENDPOINT")
+        and os.environ.get("CDC_LAKEHOUSE_S3_ACCESS_KEY")
+        and os.environ.get("CDC_LAKEHOUSE_S3_SECRET_KEY")
+    )
+    athena_ready = bool(
+        truthy_env("CDC_LAKEHOUSE_ATHENA_OPT_IN")
+        and truthy_env("CDC_LAKEHOUSE_DBT_ATHENA_OPT_IN")
+        and command_path("aws")
+        and command_path("dbt")
+    )
+    engine_ready = engine["configured"] and engine["available"]
+    minio_proof = minio_live_proof_status(output_dir)
+    minio_status = minio_proof["status"] or ("ready-for-live-run" if s3_ready else "missing-live-proof")
+    engine_bootstrap_proof = engine_proof_status(output_dir, "bootstrap")
+    engine_append_proof = engine_proof_status(output_dir, "append")
+    engine_bootstrap_status = engine_bootstrap_proof["status"] or (
+        "ready-for-engine-run" if engine_ready else "missing-engine-proof"
+    )
+    engine_append_status = engine_append_proof["status"] or (
+        "ready-for-engine-run" if engine_ready else "missing-engine-proof"
+    )
+    athena_dbt_proof = athena_dbt_proof_status(output_dir)
+    athena_dbt_status = athena_dbt_proof["status"] or (
+        "ready-for-athena-dbt-run" if athena_ready else "missing-athena-dbt-proof"
+    )
+
+    requirements = [
+        proof_requirement(
+            "local-curated-jsonl",
+            "satisfied-local-evidence",
+            "local-compatible",
+            ["iceberg-convergence", "object-storage-sink"],
+            "Keep local fixture evidence current when the curated event shape changes.",
+        ),
+        proof_requirement(
+            "local-mart-validation",
+            "satisfied-local-evidence",
+            "local-compatible",
+            ["mart-result-validation", "athena-mart-query-plan"],
+            "Keep mart SQL and rendered Athena query plan in sync.",
+        ),
+        proof_requirement(
+            "live-minio-object-sink",
+            minio_status,
+            "live-s3-compatible-endpoint",
+            ["minio-object-sink", "minio-compose-object-sink"],
+            (
+                "Run minio-object-sink or minio-compose-object-sink against a prepared MinIO/S3-compatible endpoint "
+                "and record HTTP PUT success with event id, source LSN, and event source offset."
+            ),
+            minio_proof["artifact"],
+        ),
+        proof_requirement(
+            "engine-backed-iceberg-bootstrap",
+            engine_bootstrap_status,
+            "engine-backed-iceberg",
+            ["iceberg-engine-bootstrap", "trino-compose-iceberg-bootstrap"],
+            "Run an opt-in Spark/Trino/Iceberg engine bootstrap and record engineExitCode=0.",
+            engine_bootstrap_proof["artifact"],
+        ),
+        proof_requirement(
+            "engine-backed-iceberg-append",
+            engine_append_status,
+            "engine-backed-iceberg",
+            ["iceberg-engine-append", "trino-compose-iceberg-append"],
+            "Run an opt-in Spark/Trino/Iceberg append and record engineExitCode=0 with appendedRecordCount.",
+            engine_append_proof["artifact"],
+        ),
+        proof_requirement(
+            "athena-dbt-runtime",
+            athena_dbt_status,
+            "aws-athena-dbt-athena",
+            ["athena-mart-execution", "dbt-athena-run"],
+            "Run the opt-in Athena and dbt-athena scenarios against an explicitly configured target.",
+            athena_dbt_proof["artifact"],
+            "optional-cloud-proof",
+        ),
+    ]
+    satisfied_statuses = {
+        "satisfied-local-evidence",
+        "satisfied-live-proof",
+        "satisfied-engine-proof",
+        "satisfied-athena-dbt-proof",
+    }
+    unmet = [
+        item for item in requirements
+        if item["status"] not in satisfied_statuses
+    ]
+    blocking_unmet = [
+        item for item in unmet
+        if item["requirementScope"] != "optional-cloud-proof"
+    ]
+    optional_unmet = [
+        item for item in unmet
+        if item["requirementScope"] == "optional-cloud-proof"
+    ]
+    optional_cloud_proof_ready = not optional_unmet
+    local_mvp_ready = not blocking_unmet
+    proof = {
+        "scenario": "lakehouse-proof-audit",
+        "evidenceLabel": "lakehouse-proof-audit",
+        "auditMode": "actual-live-proof-required",
+        "completionReady": local_mvp_ready,
+        "completionScope": "local-first-mvp",
+        "localMvpReady": local_mvp_ready,
+        "optionalCloudProofReady": optional_cloud_proof_ready,
+        "requirements": requirements,
+        "unmetRequirements": unmet,
+        "blockingUnmetRequirements": blocking_unmet,
+        "optionalUnmetRequirements": optional_unmet,
+        "readiness": {
+            "s3EndpointReady": s3_ready,
+            "icebergEngineReady": engine_ready,
+            "athenaDbtCliReady": athena_ready,
+            "awsCliPath": command_path("aws"),
+            "dbtCliPath": command_path("dbt"),
+            "icebergEngineCommand": engine,
+        },
+        "notes": (
+            "CompletionReady covers the local-first MVP gate: local curated evidence, mart validation, "
+            "live MinIO/S3-compatible proof, and engine-backed Iceberg bootstrap/append proof. "
+            "Athena/dbt-athena remains optional cloud proof and must not be claimed unless an opt-in run artifact is present."
+        ),
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def local_docker_images(docker):
+    if not docker["cliAvailable"] or not docker["daemonResponsive"]:
+        return []
+    completed = subprocess.run(
+        [docker["cliPath"], "images", "--format", "{{.Repository}}:{{.Tag}}"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return []
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+def has_image(images, prefixes=(), contains=()):
+    return any(
+        any(image.startswith(prefix) for prefix in prefixes)
+        or any(fragment in image for fragment in contains)
+        for image in images
+    )
+
+
+def truthy_env(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def engine_command_status():
+    raw_command = os.environ.get("CDC_LAKEHOUSE_ICEBERG_ENGINE_CMD", "").strip()
+    status = {
+        "configured": bool(raw_command),
+        "command": raw_command or None,
+        "binary": None,
+        "available": False,
+        "path": None,
+    }
+    if not raw_command:
+        return status
+    try:
+        binary = shlex.split(raw_command)[0]
+    except ValueError:
+        return status
+    status["binary"] = binary
+    if "/" in binary:
+        path = Path(binary)
+        status["available"] = path.exists()
+        status["path"] = str(path) if status["available"] else None
+        return status
+    path = command_path(binary)
+    status["available"] = path is not None
+    status["path"] = path
+    return status
+
+
+def lakehouse_runtime_preflight(_output_dir):
+    docker = docker_status()
+    images = local_docker_images(docker)
+    commands = {
+        "minio": command_path("minio"),
+        "mc": command_path("mc"),
+        "sparkSql": command_path("spark-sql"),
+        "sparkSubmit": command_path("spark-submit"),
+        "trino": command_path("trino"),
+        "dbt": command_path("dbt"),
+        "aws": command_path("aws"),
+    }
+    engine = engine_command_status()
+    s3_endpoint_configured = bool(os.environ.get("CDC_LAKEHOUSE_S3_ENDPOINT"))
+    s3_credentials_configured = bool(
+        os.environ.get("CDC_LAKEHOUSE_S3_ACCESS_KEY")
+        and os.environ.get("CDC_LAKEHOUSE_S3_SECRET_KEY")
+    )
+    athena_opt_in = truthy_env("CDC_LAKEHOUSE_ATHENA_OPT_IN")
+    dbt_athena_opt_in = truthy_env("CDC_LAKEHOUSE_DBT_ATHENA_OPT_IN")
+    local_images = {
+        "minioServer": has_image(images, prefixes=("minio/minio:",)),
+        "minioClient": has_image(images, prefixes=("minio/mc:",)),
+        "trino": has_image(images, prefixes=("trinodb/trino:", "trino:"), contains=("/trino:",)),
+        "spark": has_image(images, prefixes=("apache/spark:", "bitnami/spark:", "spark:"), contains=("/spark:",)),
+        "iceberg": has_image(images, contains=("iceberg",)),
+        "availableMatches": images,
+    }
+    readiness = {
+        "localMinioStartReady": docker["daemonResponsive"] and local_images["minioServer"],
+        "minioObjectSinkReady": s3_endpoint_configured and s3_credentials_configured,
+        "icebergEngineReady": engine["configured"] and engine["available"],
+        "athenaDbtReady": athena_opt_in and dbt_athena_opt_in and bool(commands["aws"]) and bool(commands["dbt"]),
+    }
+    blockers = []
+    if not docker["cliAvailable"]:
+        blockers.append("docker-cli-not-found")
+    elif not docker["daemonResponsive"]:
+        blockers.append("docker-daemon-not-responsive")
+    if not local_images["minioServer"]:
+        blockers.append("local-minio-image-not-available")
+    if not s3_endpoint_configured:
+        blockers.append("s3-endpoint-not-configured")
+    if s3_endpoint_configured and not s3_credentials_configured:
+        blockers.append("s3-credentials-not-configured")
+    if not engine["configured"]:
+        blockers.append("iceberg-engine-command-not-configured")
+    elif not engine["available"]:
+        blockers.append("iceberg-engine-command-not-found")
+    if not athena_opt_in or not dbt_athena_opt_in:
+        blockers.append("aws-athena-dbt-opt-in-not-configured")
+    elif not commands["aws"] or not commands["dbt"]:
+        blockers.append("aws-or-dbt-command-not-found")
+
+    proof = {
+        "scenario": "lakehouse-runtime-preflight",
+        "evidenceLabel": "lakehouse-runtime-preflight",
+        "docker": docker,
+        "localImages": local_images,
+        "commands": commands,
+        "configuration": {
+            "s3EndpointConfigured": s3_endpoint_configured,
+            "s3CredentialsConfigured": s3_credentials_configured,
+            "s3Bucket": os.environ.get("CDC_LAKEHOUSE_S3_BUCKET", DEFAULT_BUCKET),
+            "icebergEngineCommandConfigured": engine["configured"],
+            "icebergEngineCommandBinary": engine["binary"],
+            "icebergEngineCommandAvailable": engine["available"],
+            "athenaOptInConfigured": athena_opt_in,
+            "dbtAthenaOptInConfigured": dbt_athena_opt_in,
+        },
+        "readiness": readiness,
+        "blockers": blockers,
+        "nextActions": [
+            "Provide CDC_LAKEHOUSE_S3_ENDPOINT and credentials before running minio-object-sink.",
+            "Provide CDC_LAKEHOUSE_ICEBERG_ENGINE_CMD before running iceberg-engine-bootstrap and iceberg-engine-append.",
+            "Use explicit opt-in environment variables before running AWS Athena or dbt-athena proof.",
+        ],
+        "notes": "Preflight only. This does not write to MinIO/S3, execute Iceberg SQL, or run Athena/dbt-athena.",
+    }
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run local lakehouse-compatible smoke scenarios.")
+    parser.add_argument(
+        "scenario",
+        nargs="?",
+        choices=[
+            "iceberg-convergence",
+            "mart-result-validation",
+            "mart-lineage-validation",
+            "object-storage-sink",
+            "backfill-cdc-merge",
+            "multi-table-cdc-lineage",
+            "control-plane-runtime-handoff",
+            "runtime-lakehouse-replay",
+            "canonical-object-sink",
+            "s3-compatible-put-fixture",
+            "minio-object-sink",
+            "minio-compose-object-sink",
+            "lakehouse-runtime-preflight",
+            "iceberg-metadata-bootstrap",
+            "iceberg-append-fixture",
+            "iceberg-engine-bootstrap",
+            "iceberg-engine-append",
+            "trino-compose-iceberg-bootstrap",
+            "trino-compose-iceberg-append",
+            "athena-mart-query-plan",
+            "athena-mart-execution",
+            "dbt-athena-run",
+            "lakehouse-proof-audit",
+        ],
+    )
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="directory for local generated evidence")
+    args = parser.parse_args()
+
+    if args.scenario == "iceberg-convergence":
+        iceberg_convergence(Path(args.output_dir))
+        return
+    if args.scenario == "mart-result-validation":
+        mart_result_validation(Path(args.output_dir))
+        return
+    if args.scenario == "mart-lineage-validation":
+        mart_lineage_validation(Path(args.output_dir))
+        return
+    if args.scenario == "object-storage-sink":
+        object_storage_sink(Path(args.output_dir))
+        return
+    if args.scenario == "backfill-cdc-merge":
+        backfill_cdc_merge(Path(args.output_dir))
+        return
+    if args.scenario == "multi-table-cdc-lineage":
+        multi_table_cdc_lineage(Path(args.output_dir))
+        return
+    if args.scenario == "control-plane-runtime-handoff":
+        control_plane_runtime_handoff(Path(args.output_dir))
+        return
+    if args.scenario == "runtime-lakehouse-replay":
+        runtime_lakehouse_replay(Path(args.output_dir))
+        return
+    if args.scenario == "canonical-object-sink":
+        canonical_object_sink(Path(args.output_dir))
+        return
+    if args.scenario == "s3-compatible-put-fixture":
+        s3_compatible_put_fixture(Path(args.output_dir))
+        return
+    if args.scenario == "minio-object-sink":
+        minio_object_sink(Path(args.output_dir))
+        return
+    if args.scenario == "minio-compose-object-sink":
+        minio_compose_object_sink(Path(args.output_dir))
+        return
+    if args.scenario == "lakehouse-runtime-preflight":
+        lakehouse_runtime_preflight(Path(args.output_dir))
+        return
+    if args.scenario == "iceberg-metadata-bootstrap":
+        iceberg_metadata_bootstrap(Path(args.output_dir))
+        return
+    if args.scenario == "iceberg-append-fixture":
+        iceberg_append_fixture(Path(args.output_dir))
+        return
+    if args.scenario == "iceberg-engine-bootstrap":
+        iceberg_engine_bootstrap(Path(args.output_dir))
+        return
+    if args.scenario == "iceberg-engine-append":
+        iceberg_engine_append(Path(args.output_dir))
+        return
+    if args.scenario == "trino-compose-iceberg-bootstrap":
+        trino_compose_iceberg_bootstrap(Path(args.output_dir))
+        return
+    if args.scenario == "trino-compose-iceberg-append":
+        trino_compose_iceberg_append(Path(args.output_dir))
+        return
+    if args.scenario == "athena-mart-query-plan":
+        athena_mart_query_plan(Path(args.output_dir))
+        return
+    if args.scenario == "athena-mart-execution":
+        athena_mart_execution(Path(args.output_dir))
+        return
+    if args.scenario == "dbt-athena-run":
+        dbt_athena_run(Path(args.output_dir))
+        return
+    if args.scenario == "lakehouse-proof-audit":
+        lakehouse_proof_audit(Path(args.output_dir))
+        return
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"lakehouse-smoke failed: {exc}", file=sys.stderr)
+        sys.exit(1)

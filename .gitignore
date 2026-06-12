@@ -1,0 +1,11 @@
+!.gitignore
+
+.DS_Store
+
+target/
+backend/target/
+lakehouse/out/
+
+*.log
+__pycache__/
+*.pyc

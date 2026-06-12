@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OUTPUT_DIR = ROOT / "lakehouse" / "out" / "project-audit"
+DEFAULT_PROOF_DIR = ROOT / "lakehouse" / "out" / "proofs"
+CHECKBOX_RE = re.compile(r"^- \[(?P<mark>[ xX])\] (?P<text>.+)$")
+
+
+def run_command(command, check=True):
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        raise RuntimeError(
+            "command failed\n"
+            f"command: {' '.join(command)}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    return completed
+
+
+def truncate_text(value, limit=4000):
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n...<truncated>..."
+
+
+def git_repository_status():
+    git_root = run_command(["git", "rev-parse", "--show-toplevel"]).stdout.strip()
+    status = run_command(["git", "status", "--short", "--branch"]).stdout.strip().splitlines()
+    return {
+        "expectedRoot": str(ROOT),
+        "gitRoot": git_root,
+        "insideExpectedRoot": git_root == str(ROOT),
+        "statusShortBranch": status,
+    }
+
+
+def is_optional_todo_item(section):
+    return bool(section and section.lower().startswith("p5. optional"))
+
+
+def parse_todo(todo_file):
+    checked_items = []
+    unchecked_items = []
+    mvp_unchecked_items = []
+    optional_unchecked_items = []
+    current_section = None
+    lines = todo_file.read_text(encoding="utf-8").splitlines()
+    for line_number, line in enumerate(lines, start=1):
+        if line.startswith("## "):
+            current_section = line.removeprefix("## ").strip()
+            continue
+        match = CHECKBOX_RE.match(line)
+        if not match:
+            continue
+        item = {
+            "section": current_section,
+            "line": line_number,
+            "text": match.group("text"),
+            "optional": is_optional_todo_item(current_section),
+        }
+        if match.group("mark").lower() == "x":
+            checked_items.append(item)
+        else:
+            unchecked_items.append(item)
+            if item["optional"]:
+                optional_unchecked_items.append(item)
+            else:
+                mvp_unchecked_items.append(item)
+    return {
+        "path": str(todo_file),
+        "checkedCount": len(checked_items),
+        "uncheckedCount": len(unchecked_items),
+        "mvpUncheckedCount": len(mvp_unchecked_items),
+        "optionalUncheckedCount": len(optional_unchecked_items),
+        "checkedItems": checked_items,
+        "uncheckedItems": unchecked_items,
+        "mvpUncheckedItems": mvp_unchecked_items,
+        "optionalUncheckedItems": optional_unchecked_items,
+    }
+
+
+def lakehouse_proof_audit():
+    completed = run_command([
+        str(ROOT / "tools" / "runner" / "lakehouse-smoke"),
+        "lakehouse-proof-audit",
+    ])
+    return json.loads(completed.stdout)
+
+
+def proof_event_ids(proof):
+    return proof.get("eventIds") or proof.get("eventId") or []
+
+
+def proof_event_offset_lsns(proof):
+    return [
+        offset.get("lsn")
+        for offset in proof.get("eventSourceOffset", [])
+        if isinstance(offset, dict)
+    ]
+
+
+def read_json_artifact(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def phase2_runtime_sla_proof_audit(proof_dir):
+    runtime_path = proof_dir / "quality-sla-runtime.json"
+    record_path = proof_dir / "quality-sla-runtime-record.json"
+    missing = [
+        str(path)
+        for path in (runtime_path, record_path)
+        if not path.exists()
+    ]
+    base = {
+        "scenario": "phase2-runtime-sla-proof-audit",
+        "evidenceLabel": "phase2-runtime-sla-proof-audit",
+        "proofDir": str(proof_dir),
+        "requiredArtifacts": {
+            "runtimeObservation": str(runtime_path),
+            "controlPlanePersistence": str(record_path),
+        },
+        "missingArtifacts": missing,
+        "nextAction": (
+            "Run `cdc-smoke quality-sla-runtime` and "
+            "`control-plane-smoke quality-sla-runtime-record` so both proof artifacts are present."
+        ),
+    }
+    if missing:
+        return {
+            **base,
+            "completionReady": False,
+            "status": "missing-runtime-sla-proof",
+            "runtimeObservation": None,
+            "controlPlanePersistence": None,
+            "checks": [],
+        }
+
+    runtime = read_json_artifact(runtime_path)
+    record = read_json_artifact(record_path)
+    runtime_event_ids = proof_event_ids(runtime)
+    record_event_ids = proof_event_ids(record)
+    runtime_offset_lsns = proof_event_offset_lsns(runtime)
+    record_offset_lsns = proof_event_offset_lsns(record)
+    checks = [
+        {
+            "id": "runtime-observation-scenario",
+            "passed": runtime.get("scenario") == "quality-sla-runtime",
+        },
+        {
+            "id": "runtime-observation-label",
+            "passed": runtime.get("evidenceLabel") == "local-docker-debezium-runtime-sla",
+        },
+        {
+            "id": "control-plane-persistence-scenario",
+            "passed": record.get("scenario") == "quality-sla-runtime-record",
+        },
+        {
+            "id": "control-plane-persistence-label",
+            "passed": record.get("evidenceLabel") == "testcontainers-postgres-runtime-sla",
+        },
+        {
+            "id": "runtime-label-preserved",
+            "passed": record.get("runtimeEvidenceLabel") == runtime.get("evidenceLabel"),
+        },
+        {
+            "id": "source-table-matches",
+            "passed": runtime.get("sourceTable") == record.get("sourceTable") == "applicants",
+        },
+        {
+            "id": "source-lsn-matches",
+            "passed": runtime.get("sourceLsn") == record.get("sourceLsn") and bool(runtime.get("sourceLsn")),
+        },
+        {
+            "id": "event-ids-match",
+            "passed": runtime_event_ids == record_event_ids and bool(runtime_event_ids),
+        },
+        {
+            "id": "event-source-offset-lsn-matches",
+            "passed": runtime_offset_lsns == record_offset_lsns and bool(runtime_offset_lsns),
+        },
+        {
+            "id": "sla-status-matches",
+            "passed": runtime.get("slaStatus") == record.get("slaStatus"),
+        },
+        {
+            "id": "warning-slo-ids-preserved",
+            "passed": set(runtime.get("warningSloIds", [])).issubset(set(record.get("warningSloIds", []))),
+        },
+    ]
+    completion_ready = all(item["passed"] for item in checks)
+    return {
+        **base,
+        "completionReady": completion_ready,
+        "status": "satisfied-paired-runtime-sla-proof" if completion_ready else "inconsistent-runtime-sla-proof",
+        "runtimeObservation": runtime,
+        "controlPlanePersistence": record,
+        "checks": checks,
+    }
+
+
+def phase2_runtime_lakehouse_replay_audit(proof_dir):
+    handoff_path = proof_dir / "control-plane-runtime-handoff.json"
+    replay_path = proof_dir / "runtime-lakehouse-replay.json"
+    missing = [
+        str(path)
+        for path in (handoff_path, replay_path)
+        if not path.exists()
+    ]
+    base = {
+        "scenario": "phase2-runtime-lakehouse-replay-audit",
+        "evidenceLabel": "phase2-runtime-lakehouse-replay-audit",
+        "proofDir": str(proof_dir),
+        "requiredArtifacts": {
+            "controlPlaneRuntimeHandoff": str(handoff_path),
+            "runtimeLakehouseReplay": str(replay_path),
+        },
+        "missingArtifacts": missing,
+        "nextAction": (
+            "Run `lakehouse-smoke control-plane-runtime-handoff` and "
+            "`lakehouse-smoke runtime-lakehouse-replay` so both proof artifacts are present."
+        ),
+    }
+    if missing:
+        return {
+            **base,
+            "completionReady": False,
+            "status": "missing-runtime-lakehouse-replay-proof",
+            "handoff": None,
+            "replay": None,
+            "checks": [],
+        }
+
+    handoff = read_json_artifact(handoff_path)
+    replay = read_json_artifact(replay_path)
+    handoff_event_ids = proof_event_ids(handoff)
+    replay_event_ids = proof_event_ids(replay)
+    handoff_offset_lsns = proof_event_offset_lsns(handoff)
+    replay_offset_lsns = proof_event_offset_lsns(replay)
+    replay_keys = replay.get("idempotencyKeys", [])
+    checks = [
+        {
+            "id": "handoff-scenario",
+            "passed": handoff.get("scenario") == "control-plane-runtime-handoff",
+        },
+        {
+            "id": "handoff-label",
+            "passed": handoff.get("evidenceLabel") == "local-control-plane-runtime-lakehouse-handoff",
+        },
+        {
+            "id": "replay-scenario",
+            "passed": replay.get("scenario") == "runtime-lakehouse-replay",
+        },
+        {
+            "id": "replay-label",
+            "passed": replay.get("evidenceLabel") == "local-runtime-lakehouse-replay",
+        },
+        {
+            "id": "handoff-source-preserved",
+            "passed": replay.get("sourceProofScenario") == handoff.get("scenario"),
+        },
+        {
+            "id": "handoff-object-preserved",
+            "passed": replay.get("sourceHandoffObjectPath") == handoff.get("localObjectPath"),
+        },
+        {
+            "id": "source-lsn-matches",
+            "passed": handoff.get("sourceLsn") == replay.get("sourceLsn") and bool(handoff.get("sourceLsn")),
+        },
+        {
+            "id": "event-ids-match",
+            "passed": handoff_event_ids == replay_event_ids and bool(handoff_event_ids),
+        },
+        {
+            "id": "event-source-offset-lsn-matches",
+            "passed": handoff_offset_lsns == replay_offset_lsns and bool(handoff_offset_lsns),
+        },
+        {
+            "id": "replay-attempts-duplicate-suppressed",
+            "passed": replay.get("replayAttemptCount", 0) >= 2 and replay.get("suppressedDuplicateCount", 0) >= 1,
+        },
+        {
+            "id": "source-metadata-idempotency-key",
+            "passed": bool(replay_keys) and all(isinstance(key, str) and key.startswith("sha256:") for key in replay_keys),
+        },
+    ]
+    completion_ready = all(item["passed"] for item in checks)
+    return {
+        **base,
+        "completionReady": completion_ready,
+        "status": "satisfied-runtime-lakehouse-replay-proof" if completion_ready else "inconsistent-runtime-lakehouse-replay-proof",
+        "handoff": handoff,
+        "replay": replay,
+        "checks": checks,
+    }
+
+
+def build_next_actions(todo, lakehouse, phase2_runtime_sla, phase2_runtime_replay):
+    actions = []
+    for item in todo["mvpUncheckedItems"]:
+        actions.append({
+            "source": "TODO.md",
+            "section": item["section"],
+            "text": item["text"],
+        })
+    for item in lakehouse.get("blockingUnmetRequirements", []):
+        actions.append({
+            "source": "lakehouse-proof-audit",
+            "id": item["id"],
+            "text": item["nextAction"],
+        })
+    if not phase2_runtime_sla.get("completionReady"):
+        actions.append({
+            "source": "phase2-runtime-sla-proof-audit",
+            "id": phase2_runtime_sla["status"],
+            "text": phase2_runtime_sla["nextAction"],
+        })
+    if not phase2_runtime_replay.get("completionReady"):
+        actions.append({
+            "source": "phase2-runtime-lakehouse-replay-audit",
+            "id": phase2_runtime_replay["status"],
+            "text": phase2_runtime_replay["nextAction"],
+        })
+    return actions
+
+
+def build_optional_next_actions(todo, lakehouse):
+    actions = []
+    for item in todo["optionalUncheckedItems"]:
+        actions.append({
+            "source": "TODO.md",
+            "section": item["section"],
+            "text": item["text"],
+        })
+    for item in lakehouse.get("optionalUnmetRequirements", []):
+        actions.append({
+            "source": "lakehouse-proof-audit",
+            "id": item["id"],
+            "text": item["nextAction"],
+        })
+    return actions
+
+
+def render_next_proof_manifest(proof):
+    mvp_unchecked = proof["todo"]["mvpUncheckedItems"]
+    optional_unchecked = proof["todo"]["optionalUncheckedItems"]
+    lines = [
+        "# Next Proof Commands",
+        "",
+        "This manifest is not proof. It is an opt-in command checklist generated from the current project audit.",
+        "Run only the sections whose local or AWS targets are explicitly prepared.",
+        "",
+        "## Current Local-First MVP Gaps",
+        "",
+    ]
+    if not mvp_unchecked and not proof.get("nextActions"):
+        lines.append("- None.")
+    for item in mvp_unchecked:
+        lines.append(f"- `{item['section']}` line {item['line']}: {item['text']}")
+    for item in proof.get("nextActions", []):
+        if item["source"] == "lakehouse-proof-audit":
+            lines.append(f"- `{item['id']}`: {item['text']}")
+
+    lines.extend([
+        "",
+        "## Optional Cloud Proof Gaps",
+        "",
+    ])
+    optional_next_actions = proof.get("optionalNextActions", [])
+    if not optional_unchecked and not optional_next_actions:
+        lines.append("- None.")
+    for item in optional_unchecked:
+        lines.append(f"- `{item['section']}` line {item['line']}: {item['text']}")
+    for item in optional_next_actions:
+        if item["source"] == "lakehouse-proof-audit":
+            lines.append(f"- `{item['id']}`: {item['text']}")
+
+    lines.extend([
+        "",
+        "## Live MinIO/S3-Compatible Object Sink",
+        "",
+        "Use an already running MinIO/S3-compatible endpoint:",
+        "",
+        "```bash",
+        "CDC_LAKEHOUSE_S3_ENDPOINT=http://127.0.0.1:9000 \\",
+        "CDC_LAKEHOUSE_S3_ACCESS_KEY=minioadmin \\",
+        "CDC_LAKEHOUSE_S3_SECRET_KEY=minioadmin \\",
+        "./tools/runner/lakehouse-smoke minio-object-sink",
+        "```",
+        "",
+        "Or use the Compose runner after the local MinIO image is already present. The runner uses `--pull never` and must fail instead of pulling:",
+        "",
+        "```bash",
+        "./tools/runner/lakehouse-smoke minio-compose-object-sink",
+        "```",
+        "",
+        "## Engine-Backed Iceberg",
+        "",
+        "Use the local Apache Iceberg Java API engine command. It writes a HadoopCatalog table under `lakehouse/out/iceberg-java-engine/warehouse` and does not require Docker:",
+        "",
+        "```bash",
+        "CDC_LAKEHOUSE_ICEBERG_ENGINE_CMD=./tools/runner/iceberg-java-engine \\",
+        "./tools/runner/lakehouse-smoke iceberg-engine-bootstrap",
+        "",
+        "CDC_LAKEHOUSE_ICEBERG_ENGINE_CMD=./tools/runner/iceberg-java-engine \\",
+        "./tools/runner/lakehouse-smoke iceberg-engine-append",
+        "```",
+        "",
+        "Use an explicitly configured Spark/Trino/Iceberg command:",
+        "",
+        "```bash",
+        "CDC_LAKEHOUSE_ICEBERG_ENGINE_CMD='<spark-or-trino-sql-command>' \\",
+        "./tools/runner/lakehouse-smoke iceberg-engine-bootstrap",
+        "",
+        "CDC_LAKEHOUSE_ICEBERG_ENGINE_CMD='<spark-or-trino-sql-command>' \\",
+        "./tools/runner/lakehouse-smoke iceberg-engine-append",
+        "```",
+        "",
+        "Or use the local Trino Compose runners after MinIO, Trino, and catalog PostgreSQL images are already present. The runner uses `--pull never`:",
+        "",
+        "```bash",
+        "./tools/runner/lakehouse-smoke trino-compose-iceberg-bootstrap",
+        "./tools/runner/lakehouse-smoke trino-compose-iceberg-append",
+        "```",
+        "",
+        "## Athena/dbt-Athena",
+        "",
+        "Use only an explicitly configured AWS/dbt-athena target:",
+        "",
+        "```bash",
+        "CDC_LAKEHOUSE_ATHENA_OPT_IN=true \\",
+        "CDC_LAKEHOUSE_ATHENA_DATABASE=<athena-database> \\",
+        "CDC_LAKEHOUSE_ATHENA_OUTPUT_LOCATION=s3://<bucket>/athena-results/ \\",
+        "./tools/runner/lakehouse-smoke athena-mart-execution",
+        "",
+        "CDC_LAKEHOUSE_DBT_ATHENA_OPT_IN=true \\",
+        "CDC_LAKEHOUSE_ATHENA_DATABASE=<athena-database> \\",
+        "CDC_LAKEHOUSE_ATHENA_OUTPUT_LOCATION=s3://<bucket>/athena-results/ \\",
+        "./tools/runner/lakehouse-smoke dbt-athena-run",
+        "```",
+        "",
+        "## Recheck",
+        "",
+        "```bash",
+        "./tools/runner/project-audit --write-next-proof-manifest --write-completion-report",
+        "```",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def render_completion_report(proof):
+    lakehouse = proof["lakehouseProofAudit"]
+    phase2_sla = proof["phase2RuntimeSlaProofAudit"]
+    phase2_replay = proof["phase2RuntimeLakehouseReplayAudit"]
+    runtime = phase2_sla.get("runtimeObservation") or {}
+    record = phase2_sla.get("controlPlanePersistence") or {}
+    replay = phase2_replay.get("replay") or {}
+    source_lsn = runtime.get("sourceLsn") or record.get("sourceLsn") or replay.get("sourceLsn") or []
+    event_source_offset = (
+        runtime.get("eventSourceOffset")
+        or record.get("eventSourceOffset")
+        or replay.get("eventSourceOffset")
+        or []
+    )
+    event_ids = runtime.get("eventIds") or record.get("eventIds") or replay.get("eventIds") or []
+
+    lines = [
+        "# Project 05 Local-First Completion Report",
+        "",
+        "This report is generated from the current `project-audit` result and the proof artifacts under `lakehouse/out/proofs/`.",
+        "",
+        "## Status",
+        "",
+        f"- completionReady: {str(proof['completionReady']).lower()}",
+        f"- completionScope: {proof['completionScope']}",
+        f"- optionalCloudProofReady: {str(proof['optionalCloudProofReady']).lower()}",
+        f"- repositoryRoot: {proof['repository']['gitRoot']}",
+        "",
+        "## Evidence Boundary",
+        "",
+        "- Local-first MVP completion is based on repository boundary checks, TODO state, lakehouse proof audit, Phase 2 runtime SLA paired proof, and runtime-to-lakehouse replay proof.",
+        "- Docker/local proof is reproducible local evidence and is not production-scale performance proof.",
+        "- AWS Athena/dbt-athena remains opt-in and is not claimed until an explicit successful cloud proof artifact exists.",
+        "",
+        "## Local-First Proof Highlights",
+        "",
+        f"- lakehouseProofAudit: completionReady={str(lakehouse['completionReady']).lower()}, localMvpReady={str(lakehouse['localMvpReady']).lower()}",
+        f"- phase2RuntimeSlaProofAudit: status={phase2_sla['status']}, completionReady={str(phase2_sla['completionReady']).lower()}",
+        f"- phase2RuntimeLakehouseReplayAudit: status={phase2_replay['status']}, completionReady={str(phase2_replay['completionReady']).lower()}",
+        f"- source LSN: {json.dumps(source_lsn, sort_keys=True)}",
+        f"- event source offset: {json.dumps(event_source_offset, sort_keys=True)}",
+        f"- event id: {json.dumps(event_ids, sort_keys=True)}",
+        "",
+        "## Lakehouse Requirements",
+        "",
+    ]
+    for requirement in lakehouse.get("requirements", []):
+        lines.append(
+            f"- {requirement['id']}: {requirement['status']} "
+            f"({requirement['requirementScope']}, {requirement['evidenceLevel']})"
+        )
+
+    lines.extend([
+        "",
+        "## Optional Cloud Proof",
+        "",
+    ])
+    optional_actions = proof.get("optionalNextActions", [])
+    if not optional_actions:
+        lines.append("- None.")
+    for action in optional_actions:
+        action_id = action.get("id") or action.get("section") or action["source"]
+        lines.append(f"- {action_id}: {action['text']}")
+
+    lines.extend([
+        "",
+        "## Recheck",
+        "",
+        "```bash",
+        "./tools/runner/project-audit --write-next-proof-manifest --write-completion-report --run-local-verification",
+        "```",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def write_audit_artifacts(proof, output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = output_dir / "project-completion-audit.json"
+    manifest_path = output_dir / "next-proof-commands.md"
+    audit_path.write_text(json.dumps(proof, indent=2, sort_keys=True), encoding="utf-8")
+    manifest_path.write_text(render_next_proof_manifest(proof), encoding="utf-8")
+    return {
+        "auditJson": str(audit_path),
+        "nextProofManifest": str(manifest_path),
+    }
+
+
+def write_completion_report(proof, output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "completion-report.md"
+    report_path.write_text(render_completion_report(proof), encoding="utf-8")
+    return {
+        "completionReport": str(report_path),
+    }
+
+
+def local_verification_commands(output_dir):
+    manifest_output_dir = output_dir / "manifest"
+    return [
+        {
+            "id": "runner-py-compile",
+            "command": [
+                sys.executable,
+                "-m",
+                "py_compile",
+                "tools/runner/project-audit",
+                "tools/runner/lakehouse-smoke",
+                "tools/runner/cdc-smoke",
+                "tools/runner/control-plane-smoke",
+            ],
+        },
+        {
+            "id": "lakehouse-proof-audit-focused-test",
+            "command": [
+                sys.executable,
+                "tools/tests/test_lakehouse_smoke.py",
+                "-k",
+                "lakehouse_proof_audit",
+            ],
+        },
+        {
+            "id": "compose-config",
+            "command": [
+                "docker",
+                "compose",
+                "-f",
+                "infra/local/docker-compose.yml",
+                "config",
+                "-q",
+            ],
+        },
+        {
+            "id": "project-audit-manifest",
+            "command": [
+                str(ROOT / "tools" / "runner" / "project-audit"),
+                "--write-next-proof-manifest",
+                "--write-completion-report",
+                "--output-dir",
+                str(manifest_output_dir),
+            ],
+        },
+    ]
+
+
+def run_local_verification(output_dir):
+    commands = []
+    for entry in local_verification_commands(output_dir):
+        completed = run_command(entry["command"], check=False)
+        commands.append({
+            "id": entry["id"],
+            "command": entry["command"],
+            "exitCode": completed.returncode,
+            "stdout": truncate_text(completed.stdout),
+            "stderr": truncate_text(completed.stderr),
+        })
+
+    verification = {
+        "scenario": "project-local-verification",
+        "evidenceLabel": "local-verification",
+        "includesLiveProof": False,
+        "commands": commands,
+        "passed": all(item["exitCode"] == 0 for item in commands),
+        "notes": (
+            "Local verification only. This does not run live MinIO/S3-compatible, "
+            "engine-backed Iceberg, Athena, or dbt-athena proof scenarios."
+        ),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "local-verification.json"
+    path.write_text(json.dumps(verification, indent=2, sort_keys=True), encoding="utf-8")
+    return path, verification
+
+
+def project_completion_audit(
+    todo_file,
+    output_dir,
+    proof_dir,
+    write_next_proof_manifest=False,
+    write_completion_report_flag=False,
+    run_local_verification_flag=False,
+):
+    repository = git_repository_status()
+    todo = parse_todo(todo_file)
+    lakehouse = lakehouse_proof_audit()
+    phase2_runtime_sla = phase2_runtime_sla_proof_audit(proof_dir)
+    phase2_runtime_replay = phase2_runtime_lakehouse_replay_audit(proof_dir)
+    completion_ready = (
+        repository["insideExpectedRoot"]
+        and todo["mvpUncheckedCount"] == 0
+        and lakehouse.get("completionReady") is True
+        and phase2_runtime_sla.get("completionReady") is True
+        and phase2_runtime_replay.get("completionReady") is True
+    )
+    proof = {
+        "scenario": "project-completion-audit",
+        "evidenceLabel": "project-completion-audit",
+        "completionReady": completion_ready,
+        "completionScope": "local-first-mvp",
+        "optionalCloudProofReady": lakehouse.get("optionalCloudProofReady") is True,
+        "repository": repository,
+        "todo": todo,
+        "lakehouseProofAudit": lakehouse,
+        "phase2RuntimeSlaProofAudit": phase2_runtime_sla,
+        "phase2RuntimeLakehouseReplayAudit": phase2_runtime_replay,
+        "nextActions": build_next_actions(todo, lakehouse, phase2_runtime_sla, phase2_runtime_replay),
+        "optionalNextActions": build_optional_next_actions(todo, lakehouse),
+        "notes": (
+            "CompletionReady covers the local-first MVP gate from the ADR and roadmap plus paired Phase 2 runtime SLA proof "
+            "and local runtime-to-lakehouse replay proof. "
+            "Optional AWS Athena/dbt-athena proof remains visible separately and is not claimed unless an opt-in proof artifact exists."
+        ),
+    }
+    if write_next_proof_manifest:
+        proof["artifacts"] = write_audit_artifacts(proof, output_dir)
+    if write_completion_report_flag:
+        artifacts = proof.setdefault("artifacts", {})
+        artifacts.update(write_completion_report(proof, output_dir))
+    if run_local_verification_flag:
+        verification_path, verification = run_local_verification(output_dir)
+        artifacts = proof.setdefault("artifacts", {})
+        artifacts["localVerificationJson"] = str(verification_path)
+        proof["localVerification"] = verification
+        if not verification["passed"]:
+            print(json.dumps(proof, indent=2, sort_keys=True))
+            raise RuntimeError("local verification failed")
+    print(json.dumps(proof, indent=2, sort_keys=True))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run project completion audit for Project 05.")
+    parser.add_argument(
+        "--todo-file",
+        default=str(ROOT / "TODO.md"),
+        help="path to the TODO checklist used as the project completion source",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="directory for generated project audit artifacts",
+    )
+    parser.add_argument(
+        "--proof-dir",
+        default=str(DEFAULT_PROOF_DIR),
+        help="directory containing machine-readable proof artifacts",
+    )
+    parser.add_argument(
+        "--write-next-proof-manifest",
+        action="store_true",
+        help="write the audit JSON and next proof command manifest",
+    )
+    parser.add_argument(
+        "--write-completion-report",
+        action="store_true",
+        help="write a Markdown local-first MVP completion report from current audit evidence",
+    )
+    parser.add_argument(
+        "--run-local-verification",
+        action="store_true",
+        help="run non-opt-in local verification commands and write local-verification.json",
+    )
+    args = parser.parse_args()
+    project_completion_audit(
+        Path(args.todo_file),
+        Path(args.output_dir),
+        Path(args.proof_dir),
+        write_next_proof_manifest=args.write_next_proof_manifest,
+        write_completion_report_flag=args.write_completion_report,
+        run_local_verification_flag=args.run_local_verification,
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"project-audit failed: {exc}", file=sys.stderr)
+        sys.exit(1)

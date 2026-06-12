@@ -1,0 +1,11 @@
+cdc_data_platform_athena:
+  target: athena
+  outputs:
+    athena:
+      type: athena
+      region_name: "{{ env_var('AWS_REGION', 'us-east-1') }}"
+      database: "{{ env_var('CDC_LAKEHOUSE_ATHENA_CATALOG', 'awsdatacatalog') }}"
+      schema: "{{ env_var('CDC_LAKEHOUSE_ATHENA_DATABASE', 'cdc_mart') }}"
+      s3_staging_dir: "{{ env_var('CDC_LAKEHOUSE_ATHENA_OUTPUT_LOCATION') }}"
+      work_group: "{{ env_var('CDC_LAKEHOUSE_ATHENA_WORKGROUP', 'primary') }}"
+      aws_profile_name: "{{ env_var('AWS_PROFILE', '') }}"
