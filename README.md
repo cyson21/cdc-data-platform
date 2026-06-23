@@ -179,9 +179,9 @@ docs/           design, ADR, runbooks, project tracking
 |---|---|---|
 | 1 | [Portfolio One-Pager](docs/portfolio/one-pager.md) | local-first 완료와 optional cloud 경계 |
 | 2 | [Completion Report](lakehouse/out/project-audit/completion-report.md) | `project-audit` 생성 완료 보고서 |
-| 5 | [Control Plane API Runbook](docs/runbooks/control-plane-api.md) | API와 smoke 경로 |
-| 6 | [Local CDC Smoke](docs/runbooks/local-cdc-smoke.md) | Debezium/Kafka runtime 검증 |
-| 7 | [Lakehouse Smoke](docs/runbooks/lakehouse-smoke.md) | object/Iceberg/mart 검증 |
+| 3 | [Control Plane API Runbook](docs/runbooks/control-plane-api.md) | API와 smoke 경로 |
+| 4 | [Local CDC Smoke](docs/runbooks/local-cdc-smoke.md) | Debezium/Kafka runtime 검증 |
+| 5 | [Lakehouse Smoke](docs/runbooks/lakehouse-smoke.md) | object/Iceberg/mart 검증 |
 
 ## 범위 밖
 

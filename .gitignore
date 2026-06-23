@@ -9,3 +9,14 @@ lakehouse/out/
 *.log
 __pycache__/
 *.pyc
+
+# Private local docs and agent run records
+.ai-runs/
+docs/internal/
+docs/superpowers/
+docs/reviews/
+docs/portfolio/interview-guide.md
+docs/portfolio-interview-guide.md
+docs/next-agent-bootstrap.md
+docs/project-tracking.md
+TODO.md
