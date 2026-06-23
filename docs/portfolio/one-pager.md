@@ -4,6 +4,12 @@
 
 PostgreSQL 변경 이벤트를 Debezium으로 캡처하고 Kafka, Spring Boot control plane, S3/Iceberg 분석 테이블로 안정적으로 수렴시키는 CDC 기반 고가용성 데이터 플랫폼 프로젝트입니다.
 
+## 완료 상태(요약)
+
+- Local-first MVP는 `project-audit` 기준 `completionReady=true`, `completionScope=local-first-mvp`로 정리되어 있습니다.
+- `optionalCloudProofReady=false`입니다. 실제 AWS S3/Athena/dbt-athena 증명은 선택형이며, 성공 artifact가 없으므로 완료 주장으로 사용하지 않습니다.
+- 증거 분리: `MinIO`/`Iceberg`/local lakehouse 런타임 증거는 완료 범위에 포함, AWS Athena/dbt-athena는 별도 클라우드 증명으로 분리합니다.
+
 ## 왜 이 프로젝트인가
 
 마이다스아이티 포지션은 Spring Boot API 개발을 넘어 CDC 기반 데이터 파이프라인, Kafka downstream 연계, 장애 복구, S3/Iceberg/Athena/dbt 분석 환경을 요구합니다. 기존 StockRush는 Kafka/Saga/Outbox를 보여주지만 Debezium CDC와 Lakehouse가 없고, Member Event Consistency는 Kafka를 MVP에서 제외합니다. Project 05는 이 요구를 독립 축으로 직접 증명합니다.
@@ -33,6 +39,11 @@ Source PostgreSQL
 | Idempotency | source metadata 기반 ledger | 중복 이벤트가 재반영되지 않음 |
 | Recovery | retry, replay, DLQ, circuit breaker | sink 실패와 broker 중단 후 복구 |
 | Lakehouse | Iceberg snapshot, mart query | 분석 테이블로 최종 수렴 |
+
+## Proof Boundary
+
+- **완료 주장 범위(Local-first):** MinIO live object sink, local Iceberg bootstrap/append, local lakehouse replay, local quality/runtime proof artifacts.
+- **미완료 범위(Optional cloud):** AWS S3/Athena/dbt-athena 실제 실행 증거는 별도 opt-in 실행 후에만 포함합니다.
 
 ## MVP 증거
 
@@ -88,6 +99,6 @@ Source PostgreSQL
 ## 범위 절제
 
 - 실제 AWS S3/Athena/dbt-athena는 opt-in입니다.
-- 기본 증거는 MinIO, Iceberg, Trino/Spark 기반 local-first로 만듭니다.
+- 기본 증거는 MinIO, Apache Iceberg Java API engine-backed proof, local-compatible mart validation 기반 local-first로 만듭니다. Trino compose path는 별도 환경이 준비되어 green proof가 생기기 전까지 완료 주장에 넣지 않습니다.
 - 운영 규모 성능 수치는 주장하지 않고, 장애 복구와 데이터 수렴 증거에 집중합니다.
 - Local-first MVP completion은 `project-audit`의 `completionReady=true`, `phase2RuntimeSlaProofAudit.completionReady=true`, `phase2RuntimeLakehouseReplayAudit.completionReady=true`로 판단하고, optional cloud proof는 `optionalCloudProofReady=false`일 수 있음을 별도로 표시합니다.

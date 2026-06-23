@@ -4,6 +4,12 @@ PostgreSQL 변경 이벤트를 Debezium으로 캡처하고 Kafka를 거쳐 downs
 
 이 프로젝트는 ATS/역량검사형 도메인을 차용합니다. 지원자, 공고, 평가, AI agent task처럼 변경이 잦은 데이터를 source DB에 기록하고, 변경 이벤트가 운영 API와 분석 테이블까지 안정적으로 전파되는지 검증합니다.
 
+## Completion Gate (local-first)
+
+- local-first MVP 기준 completion은 `project-audit` 보고서의 `completionReady=true`, `completionScope=local-first-mvp`로 판단합니다.
+- `optionalCloudProofReady=false`: AWS 인증 기반 S3/Athena/dbt-athena 증명은 선택형(opt-in) 상태이며, 현재는 미완료입니다.
+- Local-first 증빙으로 `MinIO`, Apache Iceberg Java API engine-backed proof, local-compatible mart validation은 주장할 수 있지만, AWS Athena/dbt-athena 실행 자체는 미완료 항목으로 분리합니다.
+
 ## 상태
 
 기획 완료 후 local-first MVP 구현과 검증을 마쳤습니다. Project 04 `AI Gateway`는 보류하고 Project 05를 우선 진행합니다. 이 폴더는 parent hub에서 ignore되는 `repos/*` 아래에 있으며, 독립 Git repository로 초기화했습니다.
@@ -121,6 +127,10 @@ CDC_LAKEHOUSE_GUARDED   정규화 + retry/replay + Iceberg 수렴
 - Local lakehouse smoke: `docs/runbooks/lakehouse-smoke.md`
 - 포트폴리오 1페이지 요약: `docs/portfolio/one-pager.md`
 
+## 증명 범위 분리
+
+- **Optional cloud proof (미완료):** AWS S3, Athena, dbt-athena 실행은 현재 선택형 상태이며, 성공 proof artifact가 없으면 실제 운영형 클라우드 증빙으로 주장하지 않습니다.
+
 ## 검증 명령
 
 ```bash
@@ -208,6 +218,8 @@ TESTCONTAINERS_DOCKERCONFIG_SOURCE=autoIgnoringUserProperties TESTCONTAINERS_RYU
 - 처음부터 Kubernetes, 멀티 리전, 운영 규모 성능 주장
 - 실제 AWS 인증이 필요한 S3/Athena/dbt-athena를 기본 검증으로 강제
 - 채용 제품 UI 구현
+
+`completionReady`는 local-first MVP와 분리되어 있으며, `optionalCloudProofReady=false` 상태에서 AWS Athena/dbt-athena는 완료 주장 범위에서 제외합니다.
 
 ## Planning Complete Definition
 
