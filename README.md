@@ -47,13 +47,30 @@ A의 Kafka topic을 B가 상시 소비하거나 B의 결과가 C로 자동 전�
 
 ## 실행
 
-Docker 없이 control plane 핵심 회귀를 실행합니다.
+### Java 21 로컬 경계 검증
+
+Docker 없이 control plane과 로컬 object sink의 결정론적 회귀를 실행합니다. `pom.xml`의 release와 CI runtime은 모두 Java 21이며, 아래 명령은 Debezium·Kafka·PostgreSQL Testcontainers를 실행하지 않습니다.
 
 ```bash
-mvn -f backend/pom.xml \
-  -Dtest=CanonicalIngestServiceTest,CanonicalIngestControllerTest,PipelineQualityServiceTest,LocalLakehouseObjectSinkTest \
-  test
+mvn -B -ntp -f backend/pom.xml clean test \
+  -Dtest=CanonicalIngestServiceTest,CanonicalIngestControllerTest,PipelineQualityServiceTest,LocalLakehouseObjectSinkTest
 ```
+
+테스트 후 같은 입력에서 같은 JSON을 얻으려면 commit 시각과 commit id를 명시해 증거 리포트를 생성합니다.
+
+```bash
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
+EVIDENCE_COMMIT="$(git rev-parse HEAD)" \
+python3 tools/portfolio_evidence.py \
+  --reports backend/target/surefire-reports \
+  --output artifacts/portfolio-evidence.json
+
+python3 -m unittest tools.tests.test_portfolio_evidence
+```
+
+`artifacts/portfolio-evidence.json`은 변동 가능한 실행 시간은 제외하고 통과 수, suite 목록, commit metadata와 함께 `local-no-docker` 범위에서 증명한 항목과 증명하지 않은 항목을 분리합니다. GitHub Actions도 Temurin 21에서 같은 테스트와 생성기를 실행하고 진단용 원본 Surefire XML을 함께 업로드합니다.
+
+### 독립 runtime 실험
 
 PostgreSQL·Kafka·Debezium 실험은 독립 실행하고 종료 시 자원을 정리합니다.
 

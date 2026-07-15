@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-boundary-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Record Java runtime
+        run: |
+          mkdir -p artifacts
+          java -version 2> artifacts/java-version.txt
+          java -XshowSettings:properties -version 2>&1 \
+            | grep -E 'java\.version = 21([.+-]|$)' \
+            > artifacts/java-21-check.txt
+
+      - name: Test deterministic control-plane and local sink boundary
+        run: |
+          mvn -B -ntp -f backend/pom.xml clean test \
+            -Dtest=CanonicalIngestServiceTest,CanonicalIngestControllerTest,PipelineQualityServiceTest,LocalLakehouseObjectSinkTest
+
+      - name: Test evidence generator
+        run: python3 -m unittest tools.tests.test_portfolio_evidence
+
+      - name: Generate deterministic portfolio evidence
+        env:
+          EVIDENCE_COMMIT: ${{ github.sha }}
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          python3 tools/portfolio_evidence.py \
+            --reports backend/target/surefire-reports \
+            --output artifacts/portfolio-evidence.json
+
+      - name: Upload local-boundary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdc-data-platform-local-boundary-evidence
+          path: |
+            artifacts/
+            backend/target/surefire-reports/TEST-*.xml
+          if-no-files-found: error
+
