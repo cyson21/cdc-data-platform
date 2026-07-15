@@ -2,6 +2,10 @@
 
 PostgreSQL의 변경 이벤트를 Debezium으로 수집하고, source metadata를 기준으로 정규화·중복 억제·복구 상태를 관리하는 Java 21 기반 데이터 플랫폼 구현 프로젝트입니다. 로컬 CDC 실행 환경, Spring Boot control plane, lakehouse 저장 경로는 각각 독립적으로 검증합니다.
 
+## 포트폴리오 링크
+
+- [웹 사례](https://cyson21.github.io/projects/cdc-data-platform/) · [전체 포트폴리오 PDF](https://github.com/cyson21/portfolio-hub/releases/download/latest/portfolio-complete.pdf) · [최신 이력서](https://github.com/cyson21/portfolio-hub/releases/download/latest/resume.pdf)
+
 ## 한눈에 보기
 
 | 항목 | 내용 |
