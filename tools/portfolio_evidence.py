@@ -16,9 +16,10 @@ PROJECT = "cdc-data-platform"
 VERIFICATION_SCOPE = "local-no-docker"
 PROVEN_BOUNDARIES = [
     "canonical envelope normalization and duplicate event-id suppression",
-    "Spring MVC request/response contract for canonical ingest",
-    "pipeline quality rule evaluation with in-memory test doubles",
+    "Spring MVC request/response contracts for control-plane controllers",
+    "pipeline quality and connector health evaluation with in-memory test doubles",
     "deterministic local JSONL object key and serialization",
+    "Spring Boot context load with JDBC/Flyway autoconfiguration excluded",
 ]
 NOT_PROVEN_BOUNDARIES = [
     "live PostgreSQL-to-Debezium-to-Kafka change capture",
