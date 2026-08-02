@@ -53,18 +53,37 @@ Debezium 이벤트는 수집기 재시작이나 재전달로 중복될 수 있�
 
 ## 실행
 
-### 로컬 회귀 테스트
+### 로컬 회귀 테스트 (non-cloud)
 
-Docker 없이 제어 API와 로컬 객체 저장 경로의 회귀 테스트를 실행합니다. `pom.xml`과 CI는 Java 21을 사용하며, 아래 명령은 Debezium·Kafka·PostgreSQL Testcontainers를 실행하지 않습니다.
+Docker 없이 제어 API·서비스 단위·로컬 객체 저장 경로의 빠른 회귀를 실행합니다. `pom.xml`과 CI는 Java 21을 사용하며, 아래 명령은 Debezium·Kafka·PostgreSQL Testcontainers와 전체 Compose 스택을 실행하지 않습니다. 클래스 목록의 정본은 [`tools/ci_coverage_scopes.py`](tools/ci_coverage_scopes.py)입니다.
 
 ```bash
 mvn -B -ntp -f backend/pom.xml clean test \
-  -Dtest=CanonicalIngestServiceTest,CanonicalIngestControllerTest,PipelineQualityServiceTest,LocalLakehouseObjectSinkTest
+  -Dtest=CdcDataPlatformApplicationTest,CanonicalIngestControllerTest,CanonicalIngestServiceTest,CdcEventIdTest,DebeziumEnvelopeTest,ConnectorHealthControllerTest,ConnectorHealthHttpControllerTest,ConnectorHealthServiceTest,LocalLakehouseObjectSinkTest,PipelineQualityControllerTest,PipelineQualityServiceTest,ReplayRequestControllerTest,RetryEventControllerTest
+
+python3 -m unittest \
+  tools.tests.test_portfolio_evidence \
+  tools.tests.test_cdc_smoke_fixture \
+  tools.tests.test_lakehouse_smoke \
+  tools.tests.test_ci_coverage_scopes
+```
+
+`tools.tests.test_project_audit`는 gitignore된 `TODO.md`와 로컬 proof 산출물에 의존하므로 CI 기본 경로에 포함하지 않습니다.
+
+CI는 위 non-cloud 검증과 PostgreSQL Testcontainers 검증을 별도 job으로 분리합니다. AWS Athena/dbt-athena는 opt-in 환경 변수 없이는 실행되지 않습니다.
+
+### Testcontainers 회귀 테스트
+
+PostgreSQL Testcontainers가 필요한 JDBC·Flyway·복구 경로만 별도로 실행합니다. Docker daemon이 필요합니다.
+
+```bash
+mvn -B -ntp -f backend/pom.xml clean test \
+  -Dtest=ConnectorHealthRepositoryTest,CdcEventLedgerRepositoryTest,PipelineQualityCheckRepositoryTest,PipelineQualitySlaRepositoryTest,ReplayRequestServiceTest,KafkaRetryEventPublisherTest,RecoveryRunServiceTest,SinkFailureReplayFlowTest,RetryEventServiceTest,SchemaMigrationTest
 ```
 
 ### 독립 실행 환경 테스트
 
-PostgreSQL·Kafka·Debezium 실험은 독립 실행하고 종료 시 자원을 정리합니다.
+PostgreSQL·Kafka·Debezium 실험은 독립 실행하고 종료 시 자원을 정리합니다. CI 기본 경로에 포함하지 않습니다.
 
 ```bash
 (

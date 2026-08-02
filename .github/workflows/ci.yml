@@ -11,9 +11,65 @@ permissions:
   contents: read
 
 jobs:
-  local-boundary-verification:
+  non-cloud-regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record Java runtime
+        run: |
+          mkdir -p artifacts/non-cloud
+          java -version 2> artifacts/non-cloud/java-version.txt
+          java -XshowSettings:properties -version 2>&1 \
+            | grep -E 'java\.version = 21([.+-]|$)' \
+            > artifacts/non-cloud/java-21-check.txt
+
+      - name: Maven non-cloud regression
+        run: |
+          mvn -B -ntp -f backend/pom.xml clean test \
+            -Dtest=CdcDataPlatformApplicationTest,CanonicalIngestControllerTest,CanonicalIngestServiceTest,CdcEventIdTest,DebeziumEnvelopeTest,ConnectorHealthControllerTest,ConnectorHealthHttpControllerTest,ConnectorHealthServiceTest,LocalLakehouseObjectSinkTest,PipelineQualityControllerTest,PipelineQualityServiceTest,ReplayRequestControllerTest,RetryEventControllerTest
+
+      - name: Python non-cloud runner regression
+        run: |
+          python3 -m unittest \
+            tools.tests.test_portfolio_evidence \
+            tools.tests.test_cdc_smoke_fixture \
+            tools.tests.test_lakehouse_smoke \
+            tools.tests.test_ci_coverage_scopes
+
+      - name: Generate non-cloud portfolio evidence
+        env:
+          EVIDENCE_COMMIT: ${{ github.sha }}
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          python3 tools/portfolio_evidence.py \
+            --reports backend/target/surefire-reports \
+            --output artifacts/non-cloud/portfolio-evidence.json
+
+      - name: Upload non-cloud evidence and Surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdc-data-platform-non-cloud-evidence
+          path: |
+            artifacts/non-cloud/
+            backend/target/surefire-reports/
+          if-no-files-found: error
+
+  testcontainers-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -25,36 +81,35 @@ jobs:
 
       - name: Record Java runtime
         run: |
-          mkdir -p artifacts
-          java -version 2> artifacts/java-version.txt
+          mkdir -p artifacts/testcontainers
+          java -version 2> artifacts/testcontainers/java-version.txt
           java -XshowSettings:properties -version 2>&1 \
             | grep -E 'java\.version = 21([.+-]|$)' \
-            > artifacts/java-21-check.txt
+            > artifacts/testcontainers/java-21-check.txt
+          docker version > artifacts/testcontainers/docker-version.txt
 
-      - name: Test deterministic control-plane and local sink boundary
+      - name: Maven Testcontainers regression
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: |
           mvn -B -ntp -f backend/pom.xml clean test \
-            -Dtest=CanonicalIngestServiceTest,CanonicalIngestControllerTest,PipelineQualityServiceTest,LocalLakehouseObjectSinkTest
+            -Dtest=ConnectorHealthRepositoryTest,CdcEventLedgerRepositoryTest,PipelineQualityCheckRepositoryTest,PipelineQualitySlaRepositoryTest,ReplayRequestServiceTest,KafkaRetryEventPublisherTest,RecoveryRunServiceTest,SinkFailureReplayFlowTest,RetryEventServiceTest,SchemaMigrationTest
 
-      - name: Test evidence generator
-        run: python3 -m unittest tools.tests.test_portfolio_evidence
-
-      - name: Generate deterministic portfolio evidence
-        env:
-          EVIDENCE_COMMIT: ${{ github.sha }}
+      - name: Record Testcontainers evidence boundary
+        if: success()
         run: |
-          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
-          python3 tools/portfolio_evidence.py \
-            --reports backend/target/surefire-reports \
-            --output artifacts/portfolio-evidence.json
+          cat > artifacts/testcontainers/evidence-boundary.txt <<'EOF'
+          scope: testcontainers-postgres
+          proven: Flyway schema migration and JDBC repository/service flows against ephemeral PostgreSQL
+          not-proven: full local compose stack, live Debezium change capture, Athena/dbt, cloud resources
+          EOF
 
-      - name: Upload local-boundary evidence
+      - name: Upload Testcontainers Surefire diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cdc-data-platform-local-boundary-evidence
+          name: cdc-data-platform-testcontainers-surefire
           path: |
-            artifacts/
-            backend/target/surefire-reports/TEST-*.xml
+            artifacts/testcontainers/
+            backend/target/surefire-reports/
           if-no-files-found: error
-
