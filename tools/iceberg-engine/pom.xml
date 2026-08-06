@@ -13,9 +13,9 @@
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <iceberg.version>1.11.0</iceberg.version>
-        <hadoop.version>3.4.1</hadoop.version>
+        <hadoop.version>3.5.0</hadoop.version>
         <parquet.version>1.17.1</parquet.version>
-        <slf4j.version>2.0.17</slf4j.version>
+        <slf4j.version>2.0.18</slf4j.version>
     </properties>
 
     <dependencies>
