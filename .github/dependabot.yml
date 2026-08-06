@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      github-actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: maven
+    directories:
+      - /backend
+      - /tools/iceberg-engine
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      maven-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
