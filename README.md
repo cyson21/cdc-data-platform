@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/cyson21/cdc-data-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/cyson21/cdc-data-platform/actions/workflows/ci.yml)
 
-DB 변경을 다시 받아도 같은 변경을 두 번 반영하지 않고, 적재 실패 원인과 재처리 상태를 원천 위치와 함께 추적하는 Java 21 데이터 플랫폼 프로토타입입니다.
+CDC runtime, control plane, lakehouse 구성요소를 독립적인 범위로 구현한 Java 21 프로토타입입니다. DB 변경 중복을 막고 적재 실패 원인과 재처리 상태를 원천 위치와 함께 추적하는 범위를 검증했습니다.
 
 개인 프로젝트로 Debezium·Kafka 변경 수집, 표준 이벤트 변환, 처리 장부와 실패 재처리 API를 직접 설계·구현했습니다. 변경 수집, 처리 제어와 로컬 적재는 각각 구현했으며 하나의 상시 처리 경로로 연결하지는 않았습니다.
 
