@@ -2,7 +2,7 @@
 
 ## 한 줄 요약
 
-PostgreSQL 변경 이벤트를 Debezium으로 캡처하고 Kafka, Spring Boot control plane, S3/Iceberg 분석 테이블로 안정적으로 수렴시키는 CDC 기반 고가용성 데이터 플랫폼 프로젝트입니다.
+PostgreSQL 변경 이벤트, 처리 제어와 로컬 적재 경계를 각각 검증한 CDC 기반 Java 21 프로토타입입니다. 구성요소 간 상시 E2E 연결·고가용성·전달 보장은 이 범위에서 검증하지 않았습니다.
 
 ## 완료 상태(요약)
 
@@ -21,24 +21,29 @@ ATS/역량검사 서비스에서는 지원자, 공고, 평가, AI agent task 상
 ## 설계
 
 ```text
-Source PostgreSQL
+[Prototype A] Source PostgreSQL
   -> Debezium PostgreSQL Connector
   -> Kafka raw CDC topics
-  -> Spring Boot CDC Control Plane
+
+[Prototype B] Spring Boot CDC Control Plane
   -> canonical/retry/DLQ topics
-  -> S3-compatible storage + Iceberg tables
-  -> Athena/dbt compatible marts
+  -> database-backed processing/retry state
+
+[Prototype C] Local storage + Iceberg-compatible fixtures
+  -> local object/mart-shaped outputs
+
+Boundary: 구성요소는 독립적으로 검증했으며, 상시 E2E handoff는 구현·검증하지 않았습니다.
 ```
 
 ## 핵심 제어장치
 
 | 영역 | 제어장치 | 증명할 내용 |
 |---|---|---|
-| CDC | Debezium source offset, LSN, event id | 변경 이벤트가 유실 없이 관측됨 |
+| CDC | Debezium source offset, LSN, event id | 변경 이벤트의 source offset·LSN·event id 형태를 관찰 |
 | Kafka | raw/canonical/retry/DLQ topic 분리 | downstream 책임이 섞이지 않음 |
 | Idempotency | source metadata 기반 ledger | 중복 이벤트가 재반영되지 않음 |
-| Recovery | retry, replay, DLQ, circuit breaker | sink 실패와 broker 중단 후 복구 |
-| Lakehouse | Iceberg snapshot, mart query | 분석 테이블로 최종 수렴 |
+| Recovery | retry, replay, DLQ, circuit breaker | sink 실패와 재처리 상태 기록 경계를 검증 |
+| Lakehouse | Iceberg snapshot, mart query | 로컬 호환 snapshot/mart 결과 형태를 검증 |
 
 ## Proof Boundary
 

@@ -6,7 +6,7 @@ CDC runtime, control plane, lakehouse 구성요소를 독립적인 범위로 구
 
 개인 프로젝트로 Debezium·Kafka 변경 수집, 표준 이벤트 변환, 처리 장부와 실패 재처리 API를 직접 설계·구현했습니다. 변경 수집, 처리 제어와 로컬 적재는 각각 구현했으며 하나의 상시 처리 경로로 연결하지는 않았습니다.
 
-[웹 사례](https://cyson21.github.io/projects/cdc-data-platform/) · [전체 포트폴리오 PDF](https://github.com/cyson21/portfolio-hub/releases/download/latest/portfolio-complete.pdf) · [최신 이력서](https://github.com/cyson21/portfolio-hub/releases/download/latest/resume.pdf)
+[웹 사례](https://cyson21.github.io/projects/cdc-data-platform/) · [최신 이력서](https://github.com/cyson21/portfolio-hub/releases/download/latest/resume.pdf)
 
 ## 문제
 
