@@ -6,7 +6,7 @@ Debezium으로 받은 DB 변경 이벤트를 중복 없이 쌓고, 적재에 실
 
 변경 수집, 처리 관리, 로컬 적재는 각각 만들었고, 아직 하나의 파이프라인으로 잇지는 않았습니다.
 
-[포트폴리오](https://cyson21.github.io/projects/cdc-data-platform/) · [이력서](https://github.com/cyson21/portfolio-hub/releases/download/latest/resume.pdf)
+[포트폴리오](https://cyson21.github.io/projects/cdc-data-platform/) · [이력서](https://cyson21.github.io/downloads/resume.pdf)
 
 ## 풀려던 문제
 
@@ -108,3 +108,12 @@ PostgreSQL, Kafka, Debezium 실험은 따로 띄우고 끝나면 정리합니다
 - 재시도 상태 관리가 실제 Kafka에서 끝까지 전달되는 걸 보장하지는 않습니다.
 - 처리량, 장시간 안정성, 스키마 변경 대응, 고가용성, 복구 시간은 재지 않았습니다.
 - `lakehouse/out/`은 실행할 때마다 새로 만드는 로컬 결과물입니다.
+
+## 관련 프로젝트와 공개 자료
+
+이 저장소의 코드·실행·테스트는 이 저장소에서 관리합니다. [웹 포트폴리오의 프로젝트 설명](https://cyson21.github.io/projects/cdc-data-platform/)과 [공개 자료 안내](https://github.com/cyson21/portfolio-hub)는 외부에서 구현 근거를 찾는 진입점입니다.
+
+- 관련 주제: [stockrush](https://github.com/cyson21/stockrush) — 업무 이벤트와 DB 변경 데이터의 전달·재처리 비교.
+- 최신 제출 파일: [이력서 PDF](https://cyson21.github.io/downloads/resume.pdf) · [경력기술서 PDF](https://cyson21.github.io/downloads/career-description.pdf).
+
+위 관련 저장소는 별도로 실행하는 개인 프로젝트입니다. 서로의 서비스를 순서대로 띄우거나 실제 API·메시지로 연결한 E2E 체인이 구현됐다는 의미는 아닙니다. 구현·검증 범위가 바뀌면 이 README와 웹 프로젝트 문안을 함께 확인합니다.
